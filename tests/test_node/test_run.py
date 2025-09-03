@@ -1,4 +1,4 @@
-from triotp import node, application
+from otpylib import node, application
 
 from . import sample_app
 

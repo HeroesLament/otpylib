@@ -1,20 +1,21 @@
 import pytest
+import anyio
 
 from . import sample_kvstore as kvstore
+from otpylib.gen_server import GenServerExited
 
-from triotp.gen_server import GenServerExited
-import trio
 
+pytestmark = pytest.mark.anyio
 
 async def test_kvstore_call_delayed(test_state):
-    async with trio.open_nursery() as nursery:
-        resp = await kvstore.special_call.delayed(nursery)
+    async with anyio.create_task_group() as task_group:
+        resp = await kvstore.special_call.delayed(task_group)
 
     assert resp == "done"
 
 
 async def test_kvstore_call_timeout(test_state):
-    with pytest.raises(trio.TooSlowError):
+    with pytest.raises(TimeoutError):
         await kvstore.special_call.timedout(0.01)
 
 
@@ -22,7 +23,7 @@ async def test_kvstore_call_stopped(test_state):
     with pytest.raises(GenServerExited):
         await kvstore.special_call.stopped()
 
-    with trio.fail_after(0.1):
+    with anyio.fail_after(0.1):
         await test_state.stopped.wait()
 
     assert test_state.terminated_with is None
@@ -33,7 +34,7 @@ async def test_kvstore_call_failure(test_state):
     with pytest.raises(GenServerExited):
         await kvstore.special_call.failure()
 
-    with trio.fail_after(0.1):
+    with anyio.fail_after(0.1):
         await test_state.stopped.wait()
 
     assert isinstance(test_state.terminated_with, RuntimeError)

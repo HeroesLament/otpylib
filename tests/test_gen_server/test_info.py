@@ -1,11 +1,15 @@
-from . import sample_kvstore as kvstore
-import trio
+import anyio
+import pytest
 
+from . import sample_kvstore as kvstore
+
+
+pytestmark = pytest.mark.anyio
 
 async def test_kvstore_info_stop(test_state):
     await kvstore.special_info.stop()
 
-    with trio.fail_after(0.1):
+    with anyio.fail_after(0.1):
         await test_state.stopped.wait()
 
     assert test_state.terminated_with is None
@@ -15,7 +19,7 @@ async def test_kvstore_info_stop(test_state):
 async def test_kvstore_info_fail(test_state):
     await kvstore.special_info.fail()
 
-    with trio.fail_after(0.1):
+    with anyio.fail_after(0.1):
         await test_state.stopped.wait()
 
     assert isinstance(test_state.terminated_with, RuntimeError)
@@ -25,7 +29,7 @@ async def test_kvstore_info_fail(test_state):
 async def test_kvstore_info_matched(test_state):
     await kvstore.special_info.matched("foo")
 
-    with trio.fail_after(0.1):
+    with anyio.fail_after(0.1):
         await test_state.info.wait()
 
     assert test_state.info_val == "foo"
@@ -34,7 +38,7 @@ async def test_kvstore_info_matched(test_state):
 async def test_kvstore_info_no_match(test_state):
     await kvstore.special_info.no_match("foo")
 
-    with trio.fail_after(0.1):
+    with anyio.fail_after(0.1):
         await test_state.info.wait()
 
     assert test_state.info_val is None

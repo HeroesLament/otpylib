@@ -13,18 +13,17 @@ run.
 
 from typing import Optional, Any
 from types import ModuleType
-
-
 from contextvars import ContextVar
 from dataclasses import dataclass
 
-import trio
+import anyio
+from anyio.abc import TaskGroup
 
-from triotp import supervisor
+from otpylib import supervisor
 
 
-context_app_nursery = ContextVar[trio.Nursery]("app_nursery")
-context_app_registry = ContextVar[dict[str, trio.Nursery]]("app_registry")
+context_app_task_group = ContextVar[TaskGroup]("app_task_group")
+context_app_registry = ContextVar[dict[str, anyio.CancelScope]]("app_registry")
 
 
 @dataclass
@@ -41,8 +40,8 @@ class app_spec:
     )
 
 
-def _init(nursery: trio.Nursery) -> None:
-    context_app_nursery.set(nursery)
+def _init(task_group: TaskGroup) -> None:
+    context_app_task_group.set(task_group)
     context_app_registry.set({})
 
 
@@ -56,14 +55,22 @@ async def start(app: app_spec) -> None:
     :param app: The application to start
     """
 
-    nursery = context_app_nursery.get()
+    task_group = context_app_task_group.get()
     registry = context_app_registry.get()
 
     if app.module.__name__ not in registry:
-        local_nursery = await nursery.start(_app_scope, app)
-        assert local_nursery is not None
-
-        registry[app.module.__name__] = local_nursery
+        # Start the app scope task and get its cancel scope
+        started_event = anyio.Event()
+        cancel_scope_holder = {}
+        
+        async def wrapper():
+            await _app_scope(app, started_event, cancel_scope_holder)
+        
+        task_group.start_soon(wrapper)
+        
+        # Wait for the app scope to start and provide its cancel scope
+        await started_event.wait()
+        registry[app.module.__name__] = cancel_scope_holder['scope']
 
 
 async def stop(app_name: str) -> None:
@@ -78,19 +85,25 @@ async def stop(app_name: str) -> None:
     registry = context_app_registry.get()
 
     if app_name in registry:
-        local_nursery = registry.pop(app_name)
-        local_nursery.cancel_scope.cancel()
+        cancel_scope = registry.pop(app_name)
+        cancel_scope.cancel()
 
 
-async def _app_scope(app: app_spec, task_status=trio.TASK_STATUS_IGNORED):
+async def _app_scope(
+    app: app_spec, 
+    started_event: anyio.Event,
+    cancel_scope_holder: dict
+) -> None:
     if app.permanent:
         restart = supervisor.restart_strategy.PERMANENT
 
     else:
         restart = supervisor.restart_strategy.TRANSIENT
 
-    async with trio.open_nursery() as nursery:
-        task_status.started(nursery)
+    async with anyio.create_task_group() as tg:
+        # Store the cancel scope and signal that we're started
+        cancel_scope_holder['scope'] = tg.cancel_scope
+        started_event.set()
 
         children = [
             supervisor.child_spec(
@@ -102,4 +115,4 @@ async def _app_scope(app: app_spec, task_status=trio.TASK_STATUS_IGNORED):
         ]
         opts = app.opts if app.opts is not None else supervisor.options()
 
-        nursery.start_soon(supervisor.start, children, opts)
+        tg.start_soon(supervisor.start, children, opts)

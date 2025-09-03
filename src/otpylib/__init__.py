@@ -1,8 +1,7 @@
 """
-TriOTP is built on top of the Trio_ async library. Therefore, it is not directly
-compatible with AsyncIO libraries.
+OTPyLib is built on top of the AnyIO async library, therefore it is compatible with asyncio and trio libraries.
 
-.. _trio: https://trio.readthedocs.io
+.. _anyio: https://anyio.readthedocs.io
 
 This library revolves around the folllwing concepts:
 

@@ -1,7 +1,10 @@
-from types import ModuleType
-
+"""
+Helper utilities for otpylib modules.
+"""
 import inspect
 import sys
+
+from types import ModuleType
 
 
 def current_module() -> ModuleType:
@@ -13,7 +16,7 @@ def current_module() -> ModuleType:
     .. code-block:: python
        :caption: Example
 
-       from triotp.helpers import current_module
+       from otpylib.helpers import current_module
 
        __module__ = current_module()  # THIS WORKS
 

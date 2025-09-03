@@ -1,4 +1,4 @@
-from triotp.helpers import current_module
+from otpylib.helpers import current_module
 
 
 __module__ = current_module()

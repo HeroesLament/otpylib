@@ -5,21 +5,22 @@ from other processes.
 .. _erlang: https://erlang.org
 .. _elixir: https://elixir-lang.org/
 
-With trio, there is no such thing as a process. There is only asynchronous tasks
-started within a nursery.
+With anyio, there is no such thing as a process. There is only asynchronous tasks
+started within a task group.
 
-This module provides an encapsulation of trio's memory channels_ which allows
+This module provides an encapsulation of anyio's memory object streams_ which allows
 tasks to communicate with each other.
 
-.. _channels: https://trio.readthedocs.io/en/stable/reference-core.html#using-channels-to-pass-values-between-tasks
+.. _streams: https://anyio.readthedocs.io/en/stable/streams.html#object-streams
 
 .. code-block:: python
    :caption: Example
 
-   from triotp import mailbox
+   from anyiotp import mailbox
+   import anyio
 
 
-   async def task_a(task_status=trio.TASK_STATUS_IGNORED):
+   async def task_a(task_status=anyio.TASK_STATUS_IGNORED):
        async with mailbox.open(name='task_a') as mid:
            task_status.started(None)
 
@@ -32,9 +33,9 @@ tasks to communicate with each other.
 
 
    async def main():
-       async with trio.open_nursery() as nursery:
-           await nursery.start(task_a)
-           nursery.start_soon(task_b)
+       async with anyio.create_task_group() as tg:
+           await tg.start(task_a)  # Note: anyio doesn't have nursery.start()
+           tg.start_soon(task_b)
 """
 
 from collections.abc import Callable, Awaitable
@@ -44,20 +45,31 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from uuid import uuid4
 
-import trio
+import anyio
 
 
-type MailboxID = str  #: Mailbox identifier (UUID4)
+from typing import Dict, Tuple
 
-type MailboxRegistry = dict[
+MailboxID = str  #: Mailbox identifier (UUID4)
+
+MailboxRegistry = Dict[
     MailboxID,
-    tuple[trio.MemorySendChannel, trio.MemoryReceiveChannel],
+    Tuple[anyio.abc.ObjectSendStream, anyio.abc.ObjectReceiveStream],
 ]
 
-type NameRegistry = dict[str, MailboxID]
+NameRegistry = Dict[str, MailboxID]
 
+# Registry storage - configurable between ContextVar (isolated) and global (distributed)
+_USE_GLOBAL_REGISTRY = False
+
+# ContextVar storage (default - maintains triotp compatibility)
 context_mailbox_registry = ContextVar[MailboxRegistry]("mailbox_registry")
 context_name_registry = ContextVar[NameRegistry]("name_registry")
+
+# Global storage (optional - enables distribution)
+_global_mailbox_registry: MailboxRegistry = {}
+_global_name_registry: NameRegistry = {}
+_registry_lock = anyio.Lock()
 
 
 class MailboxDoesNotExist(RuntimeError):
@@ -88,22 +100,50 @@ class NameDoesNotExist(RuntimeError):
         super().__init__(f"mailbox {name} does not exist")
 
 
-def _init() -> None:
-    context_mailbox_registry.set({})
-    context_name_registry.set({})
-
-
-def create() -> MailboxID:
+def configure_global_registry(enabled: bool = True) -> None:
     """
-    Create a new mailbox.
-
-    :returns: The mailbox unique identifier
+    Configure whether to use global registry (for distribution) or ContextVar (for isolation).
+    
+    :param enabled: If True, use global registry. If False, use ContextVar (default triotp behavior)
     """
+    global _USE_GLOBAL_REGISTRY
+    _USE_GLOBAL_REGISTRY = enabled
 
+
+def _get_mailbox_registry() -> MailboxRegistry:
+    """Get the appropriate mailbox registry based on configuration."""
+    if _USE_GLOBAL_REGISTRY:
+        return _global_mailbox_registry
+    else:
+        return context_mailbox_registry.get()
+
+
+def _get_name_registry() -> NameRegistry:
+    """Get the appropriate name registry based on configuration."""
+    if _USE_GLOBAL_REGISTRY:
+        return _global_name_registry
+    else:
+        return context_name_registry.get()
+
+
+def init_mailbox_registry() -> None:
+    """Initialize the global otpylib mailbox registry system."""
+    if _USE_GLOBAL_REGISTRY:
+        global _global_mailbox_registry, _global_name_registry
+        _global_mailbox_registry.clear()
+        _global_name_registry.clear()
+    else:
+        context_mailbox_registry.set({})
+        context_name_registry.set({})
+
+
+def create(buffer_size: int = 100) -> MailboxID:
+    """Create a new mailbox with buffering."""
     mid = str(uuid4())
-
-    mailbox_registry = context_mailbox_registry.get()
-    mailbox_registry[mid] = trio.open_memory_channel(0)
+    
+    mailbox_registry = _get_mailbox_registry()
+    send_stream, receive_stream = anyio.create_memory_object_stream(buffer_size)
+    mailbox_registry[mid] = (send_stream, receive_stream)
 
     return mid
 
@@ -115,17 +155,16 @@ async def destroy(mid: MailboxID) -> None:
     :param mid: The mailbox identifier
     :raises MailboxDoesNotExist: The mailbox identifier was not found
     """
-
-    mailbox_registry = context_mailbox_registry.get()
+    mailbox_registry = _get_mailbox_registry()
 
     if mid not in mailbox_registry:
         raise MailboxDoesNotExist(mid)
 
     unregister_all(mid)
 
-    wchan, rchan = mailbox_registry.pop(mid)
-    await wchan.aclose()
-    await rchan.aclose()
+    send_stream, receive_stream = mailbox_registry.pop(mid)
+    await send_stream.aclose()
+    await receive_stream.aclose()
 
 
 def register(mid: MailboxID, name: str) -> None:
@@ -138,13 +177,12 @@ def register(mid: MailboxID, name: str) -> None:
     :raises MailboxDoesNotExist: The mailbox identifier was not found
     :raises NameAlreadyExist: The name was already registered
     """
-
-    mailbox_registry = context_mailbox_registry.get()
+    mailbox_registry = _get_mailbox_registry()
 
     if mid not in mailbox_registry:
         raise MailboxDoesNotExist(mid)
 
-    name_registry = context_name_registry.get()
+    name_registry = _get_name_registry()
     if name in name_registry:
         raise NameAlreadyExist(name)
 
@@ -158,8 +196,7 @@ def unregister(name: str) -> None:
     :param name: The name to unregister
     :raises NameDoesNotExist: The name was not found
     """
-
-    name_registry = context_name_registry.get()
+    name_registry = _get_name_registry()
     if name not in name_registry:
         raise NameDoesNotExist(name)
 
@@ -172,8 +209,7 @@ def unregister_all(mid: MailboxID) -> None:
 
     :param mid: The mailbox identifier
     """
-
-    name_registry = context_name_registry.get()
+    name_registry = _get_name_registry()
 
     for name, mailbox_id in list(name_registry.items()):
         if mailbox_id == mid:
@@ -193,10 +229,9 @@ async def open(name: Optional[str] = None) -> AsyncIterator[MailboxID]:
        :caption: Example
 
        async with mailbox.open(name='foo') as mid:
-           message = await mailbox.receive()
+           message = await mailbox.receive(mid)
            print(message)
     """
-
     mid = create()
 
     try:
@@ -210,7 +245,8 @@ async def open(name: Optional[str] = None) -> AsyncIterator[MailboxID]:
 
 
 def _resolve(name: str) -> Optional[MailboxID]:
-    name_registry = context_name_registry.get()
+    """Resolve a name to a mailbox ID."""
+    name_registry = _get_name_registry()
     return name_registry.get(name)
 
 
@@ -222,8 +258,7 @@ async def send(name_or_mid: Union[str, MailboxID], message: Any) -> None:
     :param message: The message to send
     :raises MailboxDoesNotExist: The mailbox was not found
     """
-
-    mailbox_registry = context_mailbox_registry.get()
+    mailbox_registry = _get_mailbox_registry()
 
     mid = _resolve(name_or_mid)
     if mid is None:
@@ -232,8 +267,8 @@ async def send(name_or_mid: Union[str, MailboxID], message: Any) -> None:
     if mid not in mailbox_registry:
         raise MailboxDoesNotExist(mid)
 
-    wchan, _ = mailbox_registry[mid]
-    await wchan.send(message)
+    send_stream, _ = mailbox_registry[mid]
+    await send_stream.send(message)
 
 
 async def receive(
@@ -251,27 +286,49 @@ async def receive(
                        returned
 
     :raises MailboxDoesNotExist: The mailbox was not found
-    :raises trio.TooSlowError: If `timeout` is set, but `on_timeout` isn't, and
-                               no message was received during the timespan set
+    :raises TimeoutError: If `timeout` is set, but `on_timeout` isn't, and
+                         no message was received during the timespan set
     """
-
-    mailbox_registry = context_mailbox_registry.get()
+    mailbox_registry = _get_mailbox_registry()
 
     if mid not in mailbox_registry:
         raise MailboxDoesNotExist(mid)
 
-    _, rchan = mailbox_registry[mid]
+    _, receive_stream = mailbox_registry[mid]
 
     if timeout is not None:
-        try:
-            with trio.fail_after(timeout):
-                return await rchan.receive()
+        with anyio.move_on_after(timeout) as cancel_scope:
+            return await receive_stream.receive()
 
-        except trio.TooSlowError:
+        # Check if we timed out
+        if cancel_scope.cancelled_caught:
             if on_timeout is None:
-                raise
+                raise TimeoutError("Mailbox receive timed out")
 
             return await on_timeout()
 
     else:
-        return await rchan.receive()
+        return await receive_stream.receive()
+
+
+# Compatibility function for task status (anyio doesn't have nursery.start equivalent)
+class TaskStatus:
+    """Mock task status for anyio compatibility."""
+    
+    def __init__(self):
+        self._started_value = None
+        self._started_event = anyio.Event()
+    
+    def started(self, value=None):
+        """Signal that task has started."""
+        self._started_value = value
+        self._started_event.set()
+    
+    async def wait_started(self):
+        """Wait for task to signal started."""
+        await self._started_event.wait()
+        return self._started_value
+
+
+# Anyio doesn't have TASK_STATUS_IGNORED, so we create a compatible version
+TASK_STATUS_IGNORED = TaskStatus()

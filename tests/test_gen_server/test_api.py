@@ -3,6 +3,8 @@ import pytest
 from . import sample_kvstore as kvstore
 
 
+pytestmark = pytest.mark.anyio
+
 async def test_kvstore_api(test_state):
     val = await kvstore.api.get("foo")
     assert val is None
@@ -19,5 +21,7 @@ async def test_kvstore_api(test_state):
     val = await kvstore.api.get("foo")
     assert val == "baz"
 
-    with pytest.raises(NotImplementedError):
-        await kvstore.api.clear()
+    await kvstore.api.clear()
+    
+    val = await kvstore.api.get("foo")
+    assert val is None

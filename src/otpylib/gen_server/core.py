@@ -21,15 +21,16 @@ There are 3 ways of sending messages to a generic server:
 .. code-block:: python
    :caption: Example
 
-   from triotp.helpers import current_module
-   from triotp import gen_server, mailbox
+   from otpylib import gen_server, mailbox
+   import types
 
 
-   __module__ = current_module()
+   # Create module-like object for callbacks
+   callbacks = types.SimpleNamespace()
 
 
    async def start():
-       await gen_server.start(__module__, name='kvstore')
+       await gen_server.start(callbacks, name='kvstore')
 
 
    async def get(key):
@@ -53,6 +54,8 @@ There are 3 ways of sending messages to a generic server:
        state = {}
        return state
 
+   callbacks.init = init
+
 
    # optional
    async def terminate(reason, state):
@@ -60,6 +63,8 @@ There are 3 ways of sending messages to a generic server:
            print('An error occured:', reason)
 
        print('Exited with state:', state)
+
+   callbacks.terminate = terminate
 
 
    # if not defined, the gen_server will stop with a NotImplementedError when
@@ -79,6 +84,8 @@ There are 3 ways of sending messages to a generic server:
                exc = NotImplementedError('unknown request')
                return (gen_server.Reply(payload=exc), state)
 
+   callbacks.handle_call = handle_call
+
 
    # if not defined, the gen_server will stop with a NotImplementedError when
    # receiving a cast
@@ -91,6 +98,8 @@ There are 3 ways of sending messages to a generic server:
                print('unknown request')
                return (gen_server.NoReply(), state)
 
+   callbacks.handle_cast = handle_cast
+
 
    # optional
    async def handle_info(message, state):
@@ -102,16 +111,19 @@ There are 3 ways of sending messages to a generic server:
                pass
 
        return (gen_server.NoReply(), state)
+
+   callbacks.handle_info = handle_info
 """
 
-from typing import TypeVar, Union, Optional, Any
+from typing import TypeVar, Union, Optional, Any, Tuple
 from types import ModuleType
+import logging
 
 from dataclasses import dataclass
 
-import trio
+import anyio
 
-from triotp import mailbox, logging
+from otpylib import mailbox
 
 
 State = TypeVar("State")
@@ -165,7 +177,7 @@ class Stop:
 
 @dataclass
 class _CallMessage:
-    source: trio.MemorySendChannel
+    source: anyio.abc.ObjectSendStream
     payload: Any
 
 
@@ -186,7 +198,7 @@ async def start(
     :param init_arg: Optional argument passed to the `init` callback
     :param name: Optional name to use to register the generic server's mailbox
 
-    :raises triotp.mailbox.NameAlreadyExist: If the `name` was already registered
+    :raises otpylib.mailbox.NameAlreadyExist: If the `name` was already registered
     :raises Exception: If the generic server terminated with a non-null reason
     """
 
@@ -214,18 +226,21 @@ async def call(
 
     """
 
-    wchan, rchan = trio.open_memory_channel[Exception | Any](0)
-    message = _CallMessage(source=wchan, payload=payload)
+    send_stream, receive_stream = anyio.create_memory_object_stream[Union[Exception, Any]](0)
+    message = _CallMessage(source=send_stream, payload=payload)
 
     await mailbox.send(name_or_mid, message)
 
     try:
         if timeout is not None:
-            with trio.fail_after(timeout):
-                val = await rchan.receive()
+            with anyio.move_on_after(timeout) as cancel_scope:
+                val = await receive_stream.receive()
+                
+            if cancel_scope.cancelled_caught:
+                raise TimeoutError("Gen server call timed out")
 
         else:
-            val = await rchan.receive()
+            val = await receive_stream.receive()
 
         if isinstance(val, Exception):
             raise val
@@ -233,8 +248,8 @@ async def call(
         return val
 
     finally:
-        await wchan.aclose()
-        await rchan.aclose()
+        await send_stream.aclose()
+        await receive_stream.aclose()
 
 
 async def cast(
@@ -252,20 +267,20 @@ async def cast(
     await mailbox.send(name_or_mid, message)
 
 
-async def reply(caller: trio.MemorySendChannel[Any], response: Any) -> None:
+async def reply(caller: anyio.abc.ObjectSendStream, response: Any) -> None:
     """
     The `handle_call` callback can start a background task to handle a slow
     request and return a `NoReply` instance. Use this function in the background
     task to send the response to the caller at a later time.
 
-    :param caller: The caller `SendChannel` to use to send the response
+    :param caller: The caller SendStream to use to send the response
     :param response: The response to send back to the caller
 
     .. code-block:: python
        :caption: Example
 
-       from triotp import gen_server, supervisor, dynamic_supervisor
-       import trio
+       from otpylib import gen_server, supervisor, dynamic_supervisor
+       import anyio
 
 
        async def slow_task(message, caller):
@@ -347,22 +362,22 @@ async def _terminate(
         await handler(reason, state)
 
     elif reason is not None:
-        logger = logging.getLogger(module.__name__)
-        logger.exception(reason)
+        logger = logging.getLogger(f"otpylib.gen_server.{module.__name__}")
+        logger.exception("Gen server terminated with exception", exc_info=reason)
 
 
 async def _handle_call(
     module: ModuleType,
     message: Any,
-    source: trio.MemorySendChannel,
+    source: anyio.abc.ObjectSendStream,
     state: State,
-) -> tuple[Continuation, State]:
+) -> Tuple[Continuation, State]:
     handler = getattr(module, "handle_call", None)
     if handler is None:
         raise NotImplementedError(f"{module.__name__}.handle_call")
 
     result = await handler(message, source, state)
-    continuation: _Loop | _Raise
+    continuation: Union[_Loop, _Raise]
 
     match result:
         case (Reply(payload), new_state):
@@ -396,13 +411,13 @@ async def _handle_cast(
     module: ModuleType,
     message: Any,
     state: State,
-) -> tuple[Continuation, State]:
+) -> Tuple[Continuation, State]:
     handler = getattr(module, "handle_cast", None)
     if handler is None:
         raise NotImplementedError(f"{module.__name__}.handle_cast")
 
     result = await handler(message, state)
-    continuation: _Loop | _Raise
+    continuation: Union[_Loop, _Raise]
 
     match result:
         case (NoReply(), new_state):
@@ -430,13 +445,13 @@ async def _handle_info(
     module: ModuleType,
     message: Any,
     state: State,
-) -> tuple[Continuation, State]:
+) -> Tuple[Continuation, State]:
     handler = getattr(module, "handle_info", None)
     if handler is None:
         return _Loop(yes=True), state
 
     result = await handler(message, state)
-    continuation: _Loop | _Raise
+    continuation: Union[_Loop, _Raise]
 
     match result:
         case (NoReply(), new_state):

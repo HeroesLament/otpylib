@@ -1,55 +1,67 @@
 [project]
-name = "triotp"
-version = "0.3.1"
-description = "The OTP framework for Python Trio"
+name = "otpylib"
+version = "0.3.0"
+description = "The OTP framework for AnyIO (trio/asyncio compatibility layer)"
 
 authors = [
-  {name = "David Delassus", email = "david.jose.delassus@gmail.com"},
+  {name = "HeroesLament", email = "nunya@biz.net"},
 ]
 
-readme = "README.rst"
+readme = "README.md"
 license = {text = "MIT"}
-keywords = ["trio", "async", "otp", "triotp"]
+keywords = ["anyio", "trio", "asyncio", "async", "otp", "actors", "supervision"]
 classifiers = [
-  "Development Status :: 4 - Beta",
-  "Framework :: Trio",
+  "Development Status :: 3 - Alpha",
+  "Framework :: AsyncIO",
+  "Framework :: Trio", 
   "Intended Audience :: Developers",
-  "Topic :: Software Development",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: System :: Distributed Computing",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
 ]
 
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
-  "trio>=0.29.0",
-  "tenacity>=9.0.0",
-  "Logbook>=1.8.1",
+  "anyio>=4.0.0",
+  "loguru>=0.7.3",
+  "result>=0.17.0",
+  "tenacity>=8.0.0",
 ]
 
 [project.urls]
-homepage = "https://linkdd.github.io/triotp"
-repository = "https://github.com/linkdd/triotp"
+homepage = "https://github.com/HeroesLament/otpylib"
+repository = "https://github.com/HeroesLament/otpylib"
+documentation = "https://github.com/HeroesLament/otpylib#readme"
+issues = "https://github.com/HeroesLament/otpylib/issues"
 
-[dependency-groups]
+[project.optional-dependencies]
 dev = [
-  "pytest>=8.3.5",
-  "pytest-trio>=0.8.0",
-  "Sphinx>=8.2.3",
-  "sphinx-rtd-theme>=3.0.2",
-  "pytest-cov>=5.0.0",
-  "black>=25.1.0",
-  "mypy>=1.15.0",
-  "coveralls>=3.3.1",
-]
-docs = [
-  "toml>=0.10.2",
+  "pytest>=8.0.0",
+  "pytest-cov>=4.0.0",
 ]
 
 [build-system]
-requires = ["pdm-backend"]
-build-backend = "pdm.backend"
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
 
-[tool.pdm]
-distribution = true
+[tool.setuptools]
+package-dir = { "" = "src" }
 
-[tool.pdm.build]
-includes = ["LICENSE.txt", "src"]
-excludes = ["tests"]
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "anyio: Mark test as an async test runnable with anyio",
+]

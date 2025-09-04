@@ -6,7 +6,8 @@ A simple supervisor example that manages a long-running service worker.
 """
 
 import anyio
-from otpylib import supervisor, mailbox
+import anyio.abc
+from otpylib import supervisor, mailbox, types
 
 
 async def hello_service():
@@ -28,17 +29,30 @@ async def main():
             id="hello_service",
             task=hello_service,
             args=[],
-            restart=supervisor.restart_strategy.PERMANENT,
+            restart=types.Permanent(),
         ),
     ]
     
     # Basic supervisor options
     opts = supervisor.options()
     
-    # Start supervisor - runs until explicitly cancelled
+    # Start supervisor with proper task status handling
+    async def run_supervisor():
+        async with anyio.create_task_group() as tg:
+            # Start the supervisor as a background task with task_status
+            handle = await tg.start(supervisor.start, children, opts)
+            
+            # The supervisor is now running, we have a handle to control it
+            print(f"Supervisor started, managing {len(handle.list_children())} children")
+            
+            # Run for 10 seconds for demo
+            await anyio.sleep(10.0)
+            
+            # Shut down gracefully
+            await handle.shutdown()
+    
     try:
-        with anyio.move_on_after(10.0):  # Cancel after 10 seconds for demo
-            await supervisor.start(children, opts)
+        await run_supervisor()
     except KeyboardInterrupt:
         pass
     

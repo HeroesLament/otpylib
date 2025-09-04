@@ -5,7 +5,7 @@ from otpylib import application, supervisor
 from otpylib.application.core import context_app_task_group, context_app_registry
 from otpylib.types import (
     # Restart Strategies
-    Permanent, Transient, Temporary, RestartStrategy,
+    Permanent, Transient, RestartStrategy,
     # Supervisor Strategies  
     OneForOne, OneForAll, RestForOne, SupervisorStrategy,
     # Shutdown Strategies

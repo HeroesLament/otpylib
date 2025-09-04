@@ -1,6 +1,6 @@
 import pytest
 import anyio
-from otpylib.mailbox.core import _init
+from otpylib.mailbox.core import init_mailbox_registry
 
 
 class GenServerTestState:
@@ -21,7 +21,7 @@ class GenServerTestState:
 @pytest.fixture
 async def mailbox_env():
     """Initialize mailbox system for tests."""
-    _init()
+    init_mailbox_registry()
     yield
     # Cleanup if needed
 
@@ -50,3 +50,21 @@ async def test_state(mailbox_env):
             await anyio.sleep(0.1)
         except Exception:
             pass
+
+
+@pytest.fixture(autouse=True)
+def clean_genserver_state():
+    """Clean gen_server global state before and after each test."""
+    from otpylib.gen_server import core as gen_server_core
+    
+    # Clear before test
+    gen_server_core._PENDING_CALLS.clear()
+    gen_server_core._GENSERVER_STATES.clear()
+    gen_server_core._CALL_COUNTER = 0
+    
+    yield
+    
+    # Clear after test
+    gen_server_core._PENDING_CALLS.clear()
+    gen_server_core._GENSERVER_STATES.clear()
+    gen_server_core._CALL_COUNTER = 0

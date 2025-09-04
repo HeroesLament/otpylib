@@ -41,7 +41,10 @@ class Consumer:
             )
 
 
-async def test_receive_no_timeout(mailbox_env):
+async def test_receive_no_timeout():
+    """Test normal message sending and receiving."""
+    mailbox.init_mailbox_registry()
+    
     producer = Producer("pytest")
     consumer = Consumer("pytest")
 
@@ -55,7 +58,10 @@ async def test_receive_no_timeout(mailbox_env):
     assert consumer.received_message == "foo"
 
 
-async def test_receive_on_timeout(mailbox_env):
+async def test_receive_on_timeout():
+    """Test receive with timeout and on_timeout callback."""
+    mailbox.init_mailbox_registry()
+    
     consumer = Consumer("pytest", timeout=0.01)
 
     async with anyio.create_task_group() as tg:
@@ -65,15 +71,25 @@ async def test_receive_on_timeout(mailbox_env):
     assert consumer.received_message is None
 
 
-async def test_receive_too_slow(mailbox_env):
+async def test_receive_too_slow():
+    """Test receive timeout without callback raises TimeoutError."""
+    mailbox.init_mailbox_registry()
+    
     consumer = Consumer("pytest", timeout=0.01, with_on_timeout=False)
 
-    with pytest.raises(TimeoutError):
+    with pytest.raises(ExceptionGroup) as exc_info:
         async with anyio.create_task_group() as tg:
             tg.start_soon(consumer)
+    
+    # Check that the ExceptionGroup contains a TimeoutError
+    assert any(isinstance(e, TimeoutError) and "Mailbox receive timed out" in str(e) 
+               for e in exc_info.value.exceptions)
 
 
-async def test_no_mailbox(mailbox_env):
+async def test_no_mailbox():
+    """Test operations on non-existent mailboxes."""
+    mailbox.init_mailbox_registry()
+    
     producer = Producer("pytest")
 
     with pytest.raises(mailbox.MailboxDoesNotExist):
@@ -83,7 +99,10 @@ async def test_no_mailbox(mailbox_env):
         await mailbox.receive("pytest")
 
 
-async def test_direct(mailbox_env):
+async def test_direct():
+    """Test direct communication using mailbox ID."""
+    mailbox.init_mailbox_registry()
+    
     consumer = Consumer(None)
 
     async with anyio.create_task_group() as tg:
@@ -99,42 +118,43 @@ async def test_direct(mailbox_env):
     assert consumer.received_message == "foo"
 
 
-async def test_register(mailbox_env):
-    consumer = Consumer("pytest")
-
+async def test_register():
+    """Test mailbox registration and name collision handling."""
+    mailbox.init_mailbox_registry()
+    
+    # Test registering non-existent mailbox
     with pytest.raises(mailbox.MailboxDoesNotExist):
         mailbox.register("not-found", "pytest")
 
-    with pytest.raises(mailbox.NameAlreadyExist):
-        async with anyio.create_task_group() as tg:
-            # Start first consumer
-            tg.start_soon(consumer)
-            await anyio.sleep(0.01)  # Give it time to register
-            
-            # Try to start second consumer with same name
-            consumer2 = Consumer("pytest")
-            tg.start_soon(consumer2)
-            await anyio.sleep(0.01)  # Wait for the error to occur
+    # Test name collision
+    async with mailbox.open("pytest") as mid1:
+        # Try to register the same name again
+        with pytest.raises(mailbox.NameAlreadyExist):
+            async with mailbox.open("pytest") as mid2:
+                pass  # This should fail in mailbox.open()
 
 
-async def test_unregister(mailbox_env):
-    consumer = Consumer("pytest")
-    producer = Producer("pytest")
-
-    with pytest.raises(mailbox.MailboxDoesNotExist):
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(consumer)
-            await anyio.sleep(0.01)  # Give consumer time to register
-
+async def test_unregister():
+    """Test mailbox unregistration."""
+    mailbox.init_mailbox_registry()
+    
+    # First create and register a mailbox
+    async with mailbox.open("pytest") as mid:
+        # Unregister the name
+        mailbox.unregister("pytest")
+        
+        # Try to unregister again - should fail
+        with pytest.raises(mailbox.NameDoesNotExist):
             mailbox.unregister("pytest")
-
-            with pytest.raises(mailbox.NameDoesNotExist):
-                mailbox.unregister("pytest")
-
-            # This should fail since mailbox was unregistered
-            await producer("foo")
+        
+        # Try to send to unregistered name - should fail
+        with pytest.raises(mailbox.MailboxDoesNotExist):
+            await mailbox.send("pytest", "foo")
 
 
-async def test_destroy_unknown(mailbox_env):
+async def test_destroy_unknown():
+    """Test destroying non-existent mailbox."""
+    mailbox.init_mailbox_registry()
+    
     with pytest.raises(mailbox.MailboxDoesNotExist):
         await mailbox.destroy("not-found")

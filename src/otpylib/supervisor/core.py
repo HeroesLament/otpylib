@@ -5,7 +5,8 @@ The static supervisor is designed to manage services that should continuously
 run and be restarted when they fail - things like web servers, database 
 connections, message processors, etc.
 
-Includes configurable health monitoring with custom probe functions.
+Includes configurable health monitoring with custom probe functions and
+optional state recovery for gen_servers.
 """
 
 from collections.abc import Callable, Awaitable
@@ -43,6 +44,7 @@ class child_spec:
     health_check_interval: float = 30.0  # Health check interval in seconds
     health_check_timeout: float = 5.0   # Health check timeout
     health_check_fn: Optional[HealthProbeFunction] = None  # Custom health probe function
+    enable_state_recovery: bool = False  # Enable state recovery for gen_servers
 
 
 @dataclass
@@ -65,6 +67,7 @@ class _ChildProcess:
     last_exception: Optional[Exception] = None
     health_check_failures: int = 0
     last_health_check: Optional[float] = None
+    supervisor_context: Optional[str] = None  # For state recovery
 
 
 class _SupervisorState:
@@ -77,13 +80,19 @@ class _SupervisorState:
         self.task_group: Optional[anyio.abc.TaskGroup] = None
         self.failed_children: List[tuple[str, Exception]] = []
         self.shutting_down = False
+        self.supervisor_id = f"sup_{id(self)}_{time.time()}"  # Unique supervisor ID
         
         # Initialize children
         for spec in specs:
-            self.children[spec.id] = _ChildProcess(
+            child = _ChildProcess(
                 spec=spec,
                 cancel_scope=CancelScope()
             )
+            # Generate supervisor context for state recovery
+            if spec.enable_state_recovery:
+                child.supervisor_context = f"{self.supervisor_id}:{spec.id}"
+            
+            self.children[spec.id] = child
             self.start_order.append(spec.id)
 
     def should_restart_child(self, child_id: str, failed: bool, exception: Optional[Exception] = None) -> bool:
@@ -281,7 +290,33 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
         
         try:
             with child.cancel_scope:
-                await child.spec.task(*child.spec.args)
+                # Check if this is a gen_server with state recovery enabled
+                from otpylib import gen_server
+                
+                if (child.spec.enable_state_recovery and 
+                    child.spec.task == gen_server.start and 
+                    child.supervisor_context):
+                    
+                    # Try state recovery for gen_servers
+                    # Assume args are [module, init_arg, name]
+                    if len(child.spec.args) >= 1:
+                        module = child.spec.args[0]
+                        init_arg = child.spec.args[1] if len(child.spec.args) > 1 else None
+                        name = child.spec.args[2] if len(child.spec.args) > 2 else None
+                        
+                        # Start with supervisor context for state recovery
+                        await gen_server.start(
+                            module,
+                            init_arg,
+                            name,
+                            _supervisor_context=child.supervisor_context
+                        )
+                    else:
+                        # Fallback to normal execution
+                        await child.spec.task(*child.spec.args)
+                else:
+                    # Normal task execution
+                    await child.spec.task(*child.spec.args)
             
             # Task completed - this is unusual for persistent services
             logger.warning(f"Child {child_id} completed unexpectedly (persistent services should not exit)")

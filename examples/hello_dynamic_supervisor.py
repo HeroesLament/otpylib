@@ -3,69 +3,125 @@
 Hello Dynamic Supervisor
 
 A simple dynamic supervisor example that starts empty,
-then adds a worker task at runtime.
+then adds worker tasks at runtime.
 """
 
 import anyio
-from otpylib import dynamic_supervisor, supervisor, mailbox
+from otpylib import dynamic_supervisor, mailbox
+from otpylib.types import Transient, Permanent, OneForOne
+from result import Ok, Err
 
 
 async def hello_worker(worker_id: str):
     """A simple worker that prints messages."""
-    for i in range(3):
+    for i in range(5):
         print(f"Hello from worker {worker_id}! (message {i+1})")
         await anyio.sleep(1.0)
     
-    print(f"Worker {worker_id} finished")
+    print(f"Worker {worker_id} finished normally")
+
+
+async def long_running_worker(worker_id: str):
+    """A worker that runs indefinitely until cancelled."""
+    counter = 0
+    try:
+        while True:
+            counter += 1
+            print(f"Long-running worker {worker_id} tick {counter}")
+            await anyio.sleep(2.0)
+    except anyio.get_cancelled_exc_class():
+        print(f"Long-running worker {worker_id} was cancelled after {counter} ticks")
+        raise
+
+
+async def worker_health_check(child_id: str, child_process) -> "Result[None, str]":
+    """Simple health check that always passes."""
+    return Ok(None)
 
 
 async def main():
     """Run dynamic supervisor and add workers at runtime."""
     print("=== Hello Dynamic Supervisor ===")
     
-    # Basic supervisor options
-    opts = supervisor.options()
+    opts = dynamic_supervisor.options(
+        max_restarts=2,
+        max_seconds=10,
+        strategy=OneForOne()
+    )
+    
+    mailbox.init_mailbox_registry()
     
     async with anyio.create_task_group() as tg:
-        # Start dynamic supervisor with a name so we can reference it
-        tg.start_soon(dynamic_supervisor.start, opts, "worker_pool")
-        
-        # Give the supervisor a moment to start
-        await anyio.sleep(0.1)
+        supervisor_handle = await tg.start(
+            dynamic_supervisor.start,
+            [],
+            opts,
+            "worker_pool"
+        )
         
         print("Dynamic supervisor started")
         
-        # Add first worker using the named supervisor
-        worker_spec = supervisor.child_spec(
-            id="worker_1",
+        # Add temporary workers
+        worker_spec_1 = dynamic_supervisor.child_spec(
+            id="temp_worker_1",
             task=hello_worker,
-            args=["1"],
-            restart=supervisor.restart_strategy.TEMPORARY,
+            args=["TEMP-1"],
+            restart=Transient(),
+            health_check_enabled=False
         )
         
-        await dynamic_supervisor.start_child("worker_pool", worker_spec)
-        print("Added worker 1")
-        
-        # Wait a bit, then add second worker
+        await dynamic_supervisor.start_child("worker_pool", worker_spec_1)
         await anyio.sleep(2.0)
         
-        worker_spec_2 = supervisor.child_spec(
-            id="worker_2", 
+        worker_spec_2 = dynamic_supervisor.child_spec(
+            id="temp_worker_2", 
             task=hello_worker,
-            args=["2"],
-            restart=supervisor.restart_strategy.TEMPORARY,
+            args=["TEMP-2"],
+            restart=Transient(),
+            health_check_enabled=False
         )
         
         await dynamic_supervisor.start_child("worker_pool", worker_spec_2)
-        print("Added worker 2")
+        await anyio.sleep(1.0)
         
-        # Let workers run for a while
-        await anyio.sleep(5.0)
+        # Add persistent worker with health checks
+        persistent_worker_spec = dynamic_supervisor.child_spec(
+            id="persistent_worker",
+            task=long_running_worker,
+            args=["PERSISTENT"],
+            restart=Permanent(),
+            health_check_enabled=True,
+            health_check_interval=10.0,
+            health_check_fn=worker_health_check
+        )
+        
+        await dynamic_supervisor.start_child("worker_pool", persistent_worker_spec)
+        
+        # Show status
+        await anyio.sleep(3.0)
+        print(f"Active children: {supervisor_handle.list_children()}")
+        
+        # Let workers run
+        await anyio.sleep(8.0)
+        
+        # Terminate persistent worker
+        await dynamic_supervisor.terminate_child("worker_pool", "persistent_worker")
+        
+        # Add final worker
+        final_worker_spec = dynamic_supervisor.child_spec(
+            id="final_worker",
+            task=hello_worker,
+            args=["FINAL"],
+            restart=Transient()
+        )
+        
+        await dynamic_supervisor.start_child("worker_pool", final_worker_spec)
+        await anyio.sleep(6.0)
+        
+        await supervisor_handle.shutdown()
     
-    print("Dynamic supervisor demo done")
+    print("Demo completed")
 
 
 if __name__ == "__main__":
-    mailbox.init_mailbox_registry()
-    
     anyio.run(main)

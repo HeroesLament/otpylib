@@ -61,7 +61,7 @@ async def _start(apps: List[application.app_spec]) -> None:
     """Internal function to start all applications within the node."""
     
     # Initialize mailbox system
-    mailbox._init()
+    mailbox.init_mailbox_registry()
 
     async with anyio.create_task_group() as tg:
         # Initialize application management

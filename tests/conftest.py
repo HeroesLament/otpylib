@@ -46,6 +46,6 @@ def log_handler():
 @pytest.fixture
 def mailbox_env():
     """Initialize mailbox system for tests."""
-    mailbox._init()
+    mailbox.init_mailbox_registry()
     yield
     # Cleanup could go here if needed

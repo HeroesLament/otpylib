@@ -12,6 +12,7 @@ optional state recovery for gen_servers.
 from collections.abc import Callable, Awaitable
 from typing import Any, Dict, List, Optional
 import logging
+import inspect
 import time
 
 from collections import deque
@@ -278,6 +279,14 @@ async def _health_monitor(state: _SupervisorState, child_id: str, logger: loggin
             
             logger.warning(f"Health check exception for {child_id} (failure #{child.health_check_failures}): {e}")
 
+def child_needs_task_status(task_func) -> bool:
+    """Check if a function signature requires task_status."""
+    try:
+        sig = inspect.signature(task_func)
+        return 'task_status' in sig.parameters
+    except (ValueError, TypeError):
+        return False
+
 
 async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Logger) -> None:
     """Run and monitor a single child, coordinating with supervisor on failures."""
@@ -305,18 +314,34 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
                         name = child.spec.args[2] if len(child.spec.args) > 2 else None
                         
                         # Start with supervisor context for state recovery
-                        await gen_server.start(
-                            module,
-                            init_arg,
-                            name,
-                            _supervisor_context=child.supervisor_context
-                        )
+                        # Need to call gen_server.start with keyword args
+                        async with anyio.create_task_group() as child_tg:
+                            async def start_with_context(*, task_status):
+                                await gen_server.start(
+                                    module,
+                                    init_arg,
+                                    name,
+                                    _supervisor_context=child.supervisor_context
+                                )
+                            await child_tg.start(start_with_context)
                     else:
-                        # Fallback to normal execution
-                        await child.spec.task(*child.spec.args)
+                        # Fallback to normal execution with inspection
+                        match child_needs_task_status(child.spec.task):
+                            case True:
+                                async with anyio.create_task_group() as child_tg:
+                                    await child_tg.start(child.spec.task, *child.spec.args)
+                            case False:
+                                await child.spec.task(*child.spec.args)
                 else:
-                    # Normal task execution
-                    await child.spec.task(*child.spec.args)
+                    # Normal task execution with inspection
+                    match child_needs_task_status(child.spec.task):
+                        case True:
+                            # Use tg.start() for functions that expect task_status
+                            async with anyio.create_task_group() as child_tg:
+                                await child_tg.start(child.spec.task, *child.spec.args)
+                        case False:
+                            # Use existing logic for simple functions
+                            await child.spec.task(*child.spec.args)
             
             # Task completed - this is unusual for persistent services
             logger.warning(f"Child {child_id} completed unexpectedly (persistent services should not exit)")

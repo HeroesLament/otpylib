@@ -10,8 +10,11 @@ import anyio.abc
 from otpylib import supervisor, mailbox, types
 
 
-async def hello_service():
+async def hello_service(*, task_status: anyio.abc.TaskStatus):
     """A service worker that runs indefinitely."""
+    # Signal that the service has started successfully
+    task_status.started()
+    
     counter = 0
     while True:
         counter += 1

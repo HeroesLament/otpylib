@@ -4,16 +4,23 @@ Hello Dynamic Supervisor
 
 A simple dynamic supervisor example that starts empty,
 then adds worker tasks at runtime.
+
+All worker functions now properly support the task_status parameter
+as required by the updated otpylib 0.3.4 API.
 """
 
 import anyio
+import anyio.abc
 from otpylib import dynamic_supervisor, mailbox
 from otpylib.types import Transient, Permanent, OneForOne
 from result import Ok, Err
 
 
-async def hello_worker(worker_id: str):
+async def hello_worker(worker_id: str, *, task_status: anyio.abc.TaskStatus):
     """A simple worker that prints messages."""
+    # Signal that the worker has started successfully
+    task_status.started()
+    
     for i in range(5):
         print(f"Hello from worker {worker_id}! (message {i+1})")
         await anyio.sleep(1.0)
@@ -21,8 +28,11 @@ async def hello_worker(worker_id: str):
     print(f"Worker {worker_id} finished normally")
 
 
-async def long_running_worker(worker_id: str):
+async def long_running_worker(worker_id: str, *, task_status: anyio.abc.TaskStatus):
     """A worker that runs indefinitely until cancelled."""
+    # Signal that the worker has started successfully
+    task_status.started()
+    
     counter = 0
     try:
         while True:

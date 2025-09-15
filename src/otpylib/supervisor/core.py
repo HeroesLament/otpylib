@@ -5,14 +5,13 @@ The static supervisor is designed to manage services that should continuously
 run and be restarted when they fail - things like web servers, database 
 connections, message processors, etc.
 
-Includes configurable health monitoring with custom probe functions and
-optional state recovery for gen_servers.
+ALL supervised functions must have *, task_status: anyio.abc.TaskStatus in their signature.
+This provides consistent structured concurrency and startup coordination.
 """
 
 from collections.abc import Callable, Awaitable
 from typing import Any, Dict, List, Optional
 import logging
-import inspect
 import time
 
 from collections import deque
@@ -279,17 +278,9 @@ async def _health_monitor(state: _SupervisorState, child_id: str, logger: loggin
             
             logger.warning(f"Health check exception for {child_id} (failure #{child.health_check_failures}): {e}")
 
-def child_needs_task_status(task_func) -> bool:
-    """Check if a function signature requires task_status."""
-    try:
-        sig = inspect.signature(task_func)
-        return 'task_status' in sig.parameters
-    except (ValueError, TypeError):
-        return False
-
 
 async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Logger) -> None:
-    """Run and monitor a single child, coordinating with supervisor on failures."""
+    """Run and monitor a single child with universal task_status support."""
 
     child = state.children[child_id]
 
@@ -314,7 +305,6 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
                         name = child.spec.args[2] if len(child.spec.args) > 2 else None
                         
                         # Start with supervisor context for state recovery
-                        # Need to call gen_server.start with keyword args
                         async with anyio.create_task_group() as child_tg:
                             async def start_with_context(*, task_status):
                                 await gen_server.start(
@@ -325,23 +315,13 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
                                 )
                             await child_tg.start(start_with_context)
                     else:
-                        # Fallback to normal execution with inspection
-                        match child_needs_task_status(child.spec.task):
-                            case True:
-                                async with anyio.create_task_group() as child_tg:
-                                    await child_tg.start(child.spec.task, *child.spec.args)
-                            case False:
-                                await child.spec.task(*child.spec.args)
+                        # Fallback to normal execution - always use tg.start()
+                        async with anyio.create_task_group() as child_tg:
+                            await child_tg.start(child.spec.task, *child.spec.args)
                 else:
-                    # Normal task execution with inspection
-                    match child_needs_task_status(child.spec.task):
-                        case True:
-                            # Use tg.start() for functions that expect task_status
-                            async with anyio.create_task_group() as child_tg:
-                                await child_tg.start(child.spec.task, *child.spec.args)
-                        case False:
-                            # Use existing logic for simple functions
-                            await child.spec.task(*child.spec.args)
+                    # Always use tg.start() for proper structured concurrency
+                    async with anyio.create_task_group() as child_tg:
+                        await child_tg.start(child.spec.task, *child.spec.args)
             
             # Task completed - this is unusual for persistent services
             logger.warning(f"Child {child_id} completed unexpectedly (persistent services should not exit)")
@@ -359,7 +339,6 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
             # NormalExit respects restart strategy
             logger.info(f"Child {child_id} exited normally")
             exception = e
-            # This will be handled by restart logic below
 
         except Exception as e:
             failed = True
@@ -371,26 +350,14 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
         should_restart = state.should_restart_child(child_id, failed, exception)
 
         if not should_restart:
-            if failed:
-                # Check if this was due to restart limit being exceeded
-                if len(child.failure_times) > state.opts.max_restarts:
-                    # Restart intensity exceeded → crash the supervisor
-                    logger.error(f"Child {child.spec.id} terminated (restart limit exceeded)")
-                    state.shutting_down = True
-                    # Raise the exception to crash the task group
-                    raise RuntimeError(
-                        f"Supervisor shutting down: restart limit exceeded for child {child_id}"
-                    ) from exception
-                else:
-                    # TRANSIENT with normal exit
-                    logger.info(f"Child {child_id} completed and will not be restarted")
-                    return
-            elif isinstance(exception, NormalExit):
-                # NormalExit with non-restarting strategy is normal
-                logger.info(f"Child {child_id} completed with NormalExit and will not be restarted")
-                return
+            if failed and len(child.failure_times) > state.opts.max_restarts:
+                # Restart intensity exceeded → crash the supervisor
+                logger.error(f"Child {child.spec.id} terminated (restart limit exceeded)")
+                state.shutting_down = True
+                raise RuntimeError(
+                    f"Supervisor shutting down: restart limit exceeded for child {child_id}"
+                ) from exception
             else:
-                # Normal completion (no exception): just stop child
                 logger.info(f"Child {child_id} completed and will not be restarted")
                 return
 

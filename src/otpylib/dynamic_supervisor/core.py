@@ -4,8 +4,11 @@ Dynamic supervisor for managing both static and dynamically added children.
 The dynamic supervisor extends the static supervisor's robust supervision logic
 to handle children that can be added and removed at runtime via message passing.
 
-It defines its own child_spec and options for flexibility while reusing the
-proven supervision algorithms from the static supervisor.
+Includes configurable health monitoring with custom probe functions and
+optional state recovery for gen_servers.
+
+ALL supervised functions must have *, task_status: anyio.abc.TaskStatus in their signature.
+This provides consistent structured concurrency and startup coordination.
 """
 
 from collections.abc import Callable, Awaitable
@@ -186,7 +189,7 @@ class _DynamicSupervisorState:
         return True
 
     async def _run_child(self, child_id: str) -> None:
-        """Run and monitor a single child (same logic as static supervisor)."""
+        """Run and monitor a single child using the task_status parameter."""
         child = self.children[child_id]
         logger = logging.getLogger("otpylib.dynamic_supervisor")
 
@@ -196,7 +199,9 @@ class _DynamicSupervisorState:
             
             try:
                 with child.cancel_scope:
-                    await child.spec.task(*child.spec.args)
+                    # Always use tg.start() for proper structured concurrency
+                    async with anyio.create_task_group() as child_tg:
+                        await child_tg.start(child.spec.task, *child.spec.args)
                 
                 # Check if this was due to cancellation (scope was cancelled but no exception was raised)
                 if child.cancel_scope.cancelled_caught:

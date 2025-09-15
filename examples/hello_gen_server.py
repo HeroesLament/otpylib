@@ -8,6 +8,7 @@ synchronous calls and asynchronous casts.
 """
 
 import anyio
+import anyio.abc
 import types
 from otpylib import gen_server, mailbox
 
@@ -140,11 +141,8 @@ async def demo_client():
 async def main():
     """Main application entry point."""
     async with anyio.create_task_group() as tg:
-        # Start the counter gen_server
-        tg.start_soon(gen_server.start, callbacks, None, "counter")
-        
-        # Give the server a moment to start
-        await anyio.sleep(0.1)
+        # Start the counter gen_server with proper task_status support
+        await tg.start(gen_server.start, callbacks, None, "counter")
         
         # Run the demo
         await demo_client()

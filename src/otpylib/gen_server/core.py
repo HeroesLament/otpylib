@@ -123,6 +123,7 @@ import uuid
 from dataclasses import dataclass
 
 import anyio
+import anyio.abc
 
 from otpylib import mailbox
 
@@ -219,6 +220,8 @@ async def start(
     name: Optional[str] = None,
     _recovered_state: Optional[Dict[str, Any]] = None,  # For direct state injection
     _supervisor_context: Optional[str] = None,  # For unique state key generation
+    *,
+    task_status: anyio.abc.TaskStatus,
 ) -> None:
     """
     Starts the generic server loop.
@@ -228,12 +231,13 @@ async def start(
     :param name: Optional name to use to register the generic server's mailbox
     :param _recovered_state: Internal parameter for direct state recovery
     :param _supervisor_context: Internal parameter for supervisor-based state recovery
+    :param task_status: Task status for structured concurrency coordination
 
     :raises otpylib.mailbox.NameAlreadyExist: If the `name` was already registered
     :raises Exception: If the generic server terminated with a non-null reason
     """
 
-    await _loop(module, init_arg, name, _recovered_state, _supervisor_context)
+    await _loop(module, init_arg, name, _recovered_state, _supervisor_context, task_status)
 
 
 async def call(
@@ -362,6 +366,7 @@ async def _loop(
     name: Optional[str],
     _recovered_state: Optional[Dict[str, Any]],
     _supervisor_context: Optional[str],
+    task_status: anyio.abc.TaskStatus,
 ) -> None:
     # Generate unique state key if applicable
     state_key = _generate_state_key(name, _supervisor_context)
@@ -418,6 +423,9 @@ async def _loop(
             else:
                 # Normal initialization
                 state = await _init(module, init_arg)
+            
+            # Signal that the gen_server is ready to handle messages
+            task_status.started()
             
             looping = True
 

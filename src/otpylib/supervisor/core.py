@@ -29,9 +29,11 @@ from otpylib.types import (
 )
 
 
+BACKOFF_DELAYS = [0.1, 0.5, 1.0, 2.0, 5.0]
+BACKOFF_RESET_THRESHOLD = 30.0  # seconds
+
 # Type alias for health probe functions
 HealthProbeFunction = Callable[[str, Any], Awaitable[Result[None, str]]]
-
 
 @dataclass
 class child_spec:
@@ -67,7 +69,9 @@ class _ChildProcess:
     last_exception: Optional[Exception] = None
     health_check_failures: int = 0
     last_health_check: Optional[float] = None
-    supervisor_context: Optional[str] = None  # For state recovery
+    supervisor_context: Optional[str] = None
+    backoff_level: int = 0
+    last_successful_start: Optional[float] = None
 
 
 class _SupervisorState:
@@ -366,4 +370,6 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
             logger.info(f"Restarting child {child_id}")
             child.restart_count += 1
             child.health_check_failures = 0  # Reset health check failures on restart
-            await anyio.sleep(0.01)  # Small delay before restart
+            delay = BACKOFF_DELAYS[min(child.backoff_level, len(BACKOFF_DELAYS) - 1)]
+            await anyio.sleep(delay)
+            child.backoff_level = min(child.backoff_level + 1, len(BACKOFF_DELAYS) - 1)

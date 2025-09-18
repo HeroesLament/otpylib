@@ -127,13 +127,34 @@ import anyio.abc
 
 from otpylib import mailbox
 
-
 State = TypeVar("State")
 
 # Global registries for transparent restart support
 _PENDING_CALLS: Dict[str, Dict[str, Any]] = {}  # Survives GenServer death
 _GENSERVER_STATES: Dict[str, Dict[str, Any]] = {}  # State preservation by unique key
 _CALL_COUNTER = 0  # For unique call IDs
+
+# Runtime integration - cached for performance
+_CACHED_RUNTIME = None
+_CACHE_VALID = False
+
+def _get_cached_runtime():
+    """Get cached runtime backend with lazy loading."""
+    global _CACHED_RUNTIME, _CACHE_VALID
+    if not _CACHE_VALID:
+        try:
+            from otpylib.runtime import get_runtime
+            _CACHED_RUNTIME = get_runtime()
+        except ImportError:
+            # Runtime module not available - use mailbox fallback
+            _CACHED_RUNTIME = None
+        _CACHE_VALID = True
+    return _CACHED_RUNTIME
+
+def _invalidate_runtime_cache():
+    """Invalidate runtime cache when backend changes."""
+    global _CACHE_VALID
+    _CACHE_VALID = False
 
 
 class GenServerExited(Exception):
@@ -236,8 +257,21 @@ async def start(
     :raises otpylib.mailbox.NameAlreadyExist: If the `name` was already registered
     :raises Exception: If the generic server terminated with a non-null reason
     """
-
-    await _loop(module, init_arg, name, _recovered_state, _supervisor_context, task_status)
+    
+    # Check if we should delegate to runtime backend
+    runtime = _get_cached_runtime()
+    if runtime:
+        # Delegate to runtime backend
+        return await runtime.spawn_gen_server(
+            module, 
+            init_arg, 
+            name,
+            supervisor_context=_supervisor_context,
+            recovered_state=_recovered_state
+        )
+    
+    # Fallback to original mailbox-based implementation
+    await _loop(module, init_arg, name, _recovered_state, _supervisor_context)
 
 
 async def call(
@@ -260,6 +294,13 @@ async def call(
     :raises Exception: If the response is an exception
 
     """
+    # Check if we should delegate to runtime backend
+    runtime = _get_cached_runtime()
+    if runtime:
+        # Delegate to runtime backend
+        return await runtime.call_process(name_or_mid, payload, timeout)
+    
+    # Original mailbox-based implementation
     global _CALL_COUNTER
     
     # Generate unique call ID for tracking
@@ -313,7 +354,14 @@ async def cast(
     :param name_or_mid: The generic server's mailbox identifier
     :param payload: The message to send
     """
+    
+    # Check if we should delegate to runtime backend
+    runtime = _get_cached_runtime()
+    if runtime:
+        # Delegate to runtime backend
+        return await runtime.cast_process(name_or_mid, payload)
 
+    # Original mailbox-based implementation
     message = _CastMessage(payload=payload)
     await mailbox.send(name_or_mid, message)
 
@@ -360,6 +408,7 @@ async def reply(caller: anyio.abc.ObjectSendStream, response: Any) -> None:
         pass
 
 
+# Rest of the implementation remains the same...
 async def _loop(
     module: ModuleType,
     init_arg: Optional[Any],

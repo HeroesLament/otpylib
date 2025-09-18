@@ -13,7 +13,7 @@ import anyio
 import anyio.abc
 from otpylib import dynamic_supervisor, mailbox
 from otpylib.types import Transient, Permanent, OneForOne
-from result import Ok, Err
+from result import Result, Ok, Err
 
 
 async def hello_worker(worker_id: str, *, task_status: anyio.abc.TaskStatus):
@@ -44,7 +44,7 @@ async def long_running_worker(worker_id: str, *, task_status: anyio.abc.TaskStat
         raise
 
 
-async def worker_health_check(child_id: str, child_process) -> "Result[None, str]":
+async def worker_health_check(child_id: str, child_process) -> Result[None, str]:
     """Simple health check that always passes."""
     return Ok(None)
 

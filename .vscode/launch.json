@@ -1,0 +1,70 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Hello GenServer",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/hello_gen_server.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "stopOnEntry": false,
+            "justMyCode": false
+        },
+        {
+            "name": "Hello Supervisor",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/hello_supervisor.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "stopOnEntry": false,
+            "justMyCode": false
+        },
+        {
+            "name": "Hello Dynamic Supervisor",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/hello_dynamic_supervisor.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "stopOnEntry": false,
+            "justMyCode": false
+        },
+        {
+            "name": "Hello Logging",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/hello_logging.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "stopOnEntry": false,
+            "justMyCode": false
+        },
+        {
+            "name": "Debug Mailbox",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/examples/debug_mailbox.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "stopOnEntry": false,
+            "justMyCode": false
+        },
+    ]
+}

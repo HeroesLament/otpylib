@@ -271,7 +271,7 @@ async def start(
         )
     
     # Fallback to original mailbox-based implementation
-    await _loop(module, init_arg, name, _recovered_state, _supervisor_context)
+    await _loop(module, init_arg, name, _recovered_state, _supervisor_context, task_status)
 
 
 async def call(

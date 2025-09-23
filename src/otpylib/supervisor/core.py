@@ -294,21 +294,21 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
         
         try:
             with child.cancel_scope:
-                # Check if this is a gen_server with state recovery enabled
+                #  Check if this is a gen_server with state recovery enabled
                 from otpylib import gen_server
                 
                 if (child.spec.enable_state_recovery and 
                     child.spec.task == gen_server.start and 
                     child.supervisor_context):
                     
-                    # Try state recovery for gen_servers
-                    # Assume args are [module, init_arg, name]
+                    #  Try state recovery for gen_servers
+                    #  Assume args are [module, init_arg, name]
                     if len(child.spec.args) >= 1:
                         module = child.spec.args[0]
                         init_arg = child.spec.args[1] if len(child.spec.args) > 1 else None
                         name = child.spec.args[2] if len(child.spec.args) > 2 else None
                         
-                        # Start with supervisor context for state recovery
+                        #  Start with supervisor context for state recovery
                         async with anyio.create_task_group() as child_tg:
                             async def start_with_context(*, task_status):
                                 await gen_server.start(
@@ -319,20 +319,20 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
                                 )
                             await child_tg.start(start_with_context)
                     else:
-                        # Fallback to normal execution - always use tg.start()
+                        #  Fallback to normal execution - always use tg.start()
                         async with anyio.create_task_group() as child_tg:
                             await child_tg.start(child.spec.task, *child.spec.args)
                 else:
-                    # Always use tg.start() for proper structured concurrency
+                    #  Always use tg.start() for proper structured concurrency
                     async with anyio.create_task_group() as child_tg:
                         await child_tg.start(child.spec.task, *child.spec.args)
             
-            # Task completed - this is unusual for persistent services
+            #  Task completed - this is unusual for persistent services
             logger.warning(f"Child {child_id} completed unexpectedly (persistent services should not exit)")
 
         except anyio.get_cancelled_exc_class():
             logger.info(f"Child {child_id} cancelled by supervisor")
-            return
+            return  # Exit immediately on cancellation - don't attempt restart
 
         except ShutdownExit:
             # ShutdownExit means never restart regardless of strategy
@@ -350,7 +350,12 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
             child.last_exception = e
             logger.error(f"Child {child.spec.id} failed", exc_info=e)
 
-        # Decide what to do next
+        #  Check shutdown status before any restart logic
+        if state.shutting_down:
+            logger.info(f"Supervisor shutting down, not restarting {child_id}")
+            return
+
+        #  Decide what to do next
         should_restart = state.should_restart_child(child_id, failed, exception)
 
         if not should_restart:
@@ -365,11 +370,27 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
                 logger.info(f"Child {child_id} completed and will not be restarted")
                 return
 
-        # Otherwise restart the child after a small delay
-        if not state.shutting_down:
-            logger.info(f"Restarting child {child_id}")
-            child.restart_count += 1
-            child.health_check_failures = 0  # Reset health check failures on restart
-            delay = BACKOFF_DELAYS[min(child.backoff_level, len(BACKOFF_DELAYS) - 1)]
-            await anyio.sleep(delay)
-            child.backoff_level = min(child.backoff_level + 1, len(BACKOFF_DELAYS) - 1)
+        #  Double-check shutdown status before sleeping/restarting
+        if state.shutting_down:
+            logger.info(f"Supervisor shutting down during restart attempt for {child_id}")
+            return
+
+        #  Otherwise restart the child after a small delay
+        logger.info(f"Restarting child {child_id}")
+        child.restart_count += 1
+        child.health_check_failures = 0  # Reset health check failures on restart
+        delay = BACKOFF_DELAYS[min(child.backoff_level, len(BACKOFF_DELAYS) - 1)]
+        
+        #  Sleep with periodic shutdown checks to avoid hanging during shutdown
+        sleep_interval = 0.1
+        total_slept = 0.0
+        while total_slept < delay and not state.shutting_down:
+            await anyio.sleep(min(sleep_interval, delay - total_slept))
+            total_slept += sleep_interval
+        
+        #  Final check before loop continues
+        if state.shutting_down:
+            logger.info(f"Supervisor shutting down during restart delay for {child_id}")
+            return
+            
+        child.backoff_level = min(child.backoff_level + 1, len(BACKOFF_DELAYS) - 1)

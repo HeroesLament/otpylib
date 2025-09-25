@@ -1,6 +1,6 @@
 [project]
 name = "otpylib"
-version = "0.3.8"
+version = "0.3.9"
 description = "The OTP framework for AnyIO (trio/asyncio compatibility layer)"
 
 authors = [

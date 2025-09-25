@@ -11,10 +11,10 @@ __module__ = current_module()
 pytestmark = pytest.mark.anyio
 
 
-async def start(test_state):
+async def start(test_state, *, task_status):
     try:
         callbacks = create_callbacks()
-        await gen_server.start(callbacks, test_state, name=__name__)
+        await gen_server.start(callbacks, test_state, name=__name__, task_status=task_status)
 
     except Exception as err:
         test_state.did_raise = err

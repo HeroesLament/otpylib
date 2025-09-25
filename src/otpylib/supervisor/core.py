@@ -99,35 +99,39 @@ class _SupervisorState:
             self.children[spec.id] = child
             self.start_order.append(spec.id)
 
-    def should_restart_child(self, child_id: str, failed: bool, exception: Optional[Exception] = None) -> bool:
-        """Check if a specific child should restart."""
+    def should_restart_child(self, child_id: str, failed: bool, exception: Optional[Exception] = None) -> tuple[bool, bool]:
+        """Check if a specific child should restart.
+        
+        Returns:
+            tuple[should_restart: bool, limit_exceeded: bool]
+        """
         child = self.children[child_id]
         
         # If shutting down, don't restart
         if self.shutting_down:
-            return False
+            return False, False
 
         # For TRANSIENT: only restart on actual exceptions (not normal completion or NormalExit)
         if isinstance(child.spec.restart, Transient):
             if not failed or isinstance(exception, NormalExit):
-                return False
+                return False, False
 
         # Only count actual failures (exceptions that aren't NormalExit) for restart limits
         if failed and isinstance(exception, Exception) and not isinstance(exception, NormalExit):
-            # Check if within time window
+            # Add current failure first
             current_time = time.time()
             child.failure_times.append(current_time)
             
-            # Remove failures outside the time window
+            # Check restart limit BEFORE time window cleanup to avoid race conditions
+            if len(child.failure_times) > self.opts.max_restarts:
+                return False, True  # Don't restart, limit exceeded
+            
+            # Only AFTER checking limits, clean up old failures for future iterations
             cutoff_time = current_time - self.opts.max_seconds
             while child.failure_times and child.failure_times[0] < cutoff_time:
                 child.failure_times.popleft()
-            
-            # Check if we've exceeded max_restarts within the time window
-            if len(child.failure_times) > self.opts.max_restarts:
-                return False
 
-        return True
+        return True, False
 
     def get_affected_children(self, failed_child_id: str, exceeded_limit: bool) -> List[str]:
         """Determine which children are affected by a failure."""
@@ -294,21 +298,21 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
         
         try:
             with child.cancel_scope:
-                #  Check if this is a gen_server with state recovery enabled
+                # Check if this is a gen_server with state recovery enabled
                 from otpylib import gen_server
                 
                 if (child.spec.enable_state_recovery and 
                     child.spec.task == gen_server.start and 
                     child.supervisor_context):
                     
-                    #  Try state recovery for gen_servers
-                    #  Assume args are [module, init_arg, name]
+                    # Try state recovery for gen_servers
+                    # Assume args are [module, init_arg, name]
                     if len(child.spec.args) >= 1:
                         module = child.spec.args[0]
                         init_arg = child.spec.args[1] if len(child.spec.args) > 1 else None
                         name = child.spec.args[2] if len(child.spec.args) > 2 else None
                         
-                        #  Start with supervisor context for state recovery
+                        # Start with supervisor context for state recovery
                         async with anyio.create_task_group() as child_tg:
                             async def start_with_context(*, task_status):
                                 await gen_server.start(
@@ -319,15 +323,15 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
                                 )
                             await child_tg.start(start_with_context)
                     else:
-                        #  Fallback to normal execution - always use tg.start()
+                        # Fallback to normal execution - always use tg.start()
                         async with anyio.create_task_group() as child_tg:
                             await child_tg.start(child.spec.task, *child.spec.args)
                 else:
-                    #  Always use tg.start() for proper structured concurrency
+                    # Always use tg.start() for proper structured concurrency
                     async with anyio.create_task_group() as child_tg:
                         await child_tg.start(child.spec.task, *child.spec.args)
             
-            #  Task completed - this is unusual for persistent services
+            # Task completed - this is unusual for persistent services
             logger.warning(f"Child {child_id} completed unexpectedly (persistent services should not exit)")
 
         except anyio.get_cancelled_exc_class():
@@ -350,45 +354,47 @@ async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Log
             child.last_exception = e
             logger.error(f"Child {child.spec.id} failed", exc_info=e)
 
-        #  Check shutdown status before any restart logic
+        # CRITICAL: Check shutdown status before any restart logic
         if state.shutting_down:
             logger.info(f"Supervisor shutting down, not restarting {child_id}")
             return
 
-        #  Decide what to do next
-        should_restart = state.should_restart_child(child_id, failed, exception)
+        # Decide what to do next - CHECK LIMITS BEFORE ANY DELAYS
+        should_restart, limit_exceeded = state.should_restart_child(child_id, failed, exception)
+
+        if limit_exceeded:
+            # Restart intensity exceeded → crash the supervisor IMMEDIATELY
+            logger.error(f"Child {child.spec.id} terminated (restart limit exceeded)")
+            state.shutting_down = True
+            raise RuntimeError(
+                f"Supervisor shutting down: restart limit exceeded for child {child_id}"
+            ) from exception
 
         if not should_restart:
-            if failed and len(child.failure_times) > state.opts.max_restarts:
-                # Restart intensity exceeded → crash the supervisor
-                logger.error(f"Child {child.spec.id} terminated (restart limit exceeded)")
-                state.shutting_down = True
-                raise RuntimeError(
-                    f"Supervisor shutting down: restart limit exceeded for child {child_id}"
-                ) from exception
-            else:
-                logger.info(f"Child {child_id} completed and will not be restarted")
-                return
+            logger.info(f"Child {child_id} completed and will not be restarted")
+            return
 
-        #  Double-check shutdown status before sleeping/restarting
+        # Double-check shutdown status before sleeping/restarting
         if state.shutting_down:
             logger.info(f"Supervisor shutting down during restart attempt for {child_id}")
             return
 
-        #  Otherwise restart the child after a small delay
+        # Otherwise restart the child after a small delay
         logger.info(f"Restarting child {child_id}")
         child.restart_count += 1
         child.health_check_failures = 0  # Reset health check failures on restart
+        
+        # Apply backoff delay AFTER confirming we should restart
         delay = BACKOFF_DELAYS[min(child.backoff_level, len(BACKOFF_DELAYS) - 1)]
         
-        #  Sleep with periodic shutdown checks to avoid hanging during shutdown
+        # Sleep with periodic shutdown checks to avoid hanging during shutdown
         sleep_interval = 0.1
         total_slept = 0.0
         while total_slept < delay and not state.shutting_down:
             await anyio.sleep(min(sleep_interval, delay - total_slept))
             total_slept += sleep_interval
         
-        #  Final check before loop continues
+        # Final check before loop continues
         if state.shutting_down:
             logger.info(f"Supervisor shutting down during restart delay for {child_id}")
             return

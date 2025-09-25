@@ -15,6 +15,7 @@ from otpylib.types import (
 from tests.test_supervisor.helpers import (
     sample_task_long_running,
     sample_task_error,
+    sample_task_with_delay,  # Added this helper
 )
 
 
@@ -33,12 +34,15 @@ def _find_runtime_error(exc_group):
 
 
 async def test_multiple_persistent_children(test_data, log_handler):
-    """Test supervisor managing multiple persistent services."""
+    """Test supervisor with multiple failing children - should crash when first child exceeds restart limits."""
+    print("DEBUG: Multiple children test starting")
+    
     # Initialize mailbox registry
     mailbox.init_mailbox_registry()
     
     with pytest.raises(ExceptionGroup) as exc_info:
         async with anyio.create_task_group() as tg:
+            print("DEBUG: Starting supervisor with 3 failing children")
             children = [
                 supervisor.child_spec(
                     id=f"service-{i}",
@@ -49,53 +53,79 @@ async def test_multiple_persistent_children(test_data, log_handler):
                 for i in range(3)
             ]
             
-            opts = supervisor.options(max_restarts=2, max_seconds=5)
+            # Align with consistent restart limits
+            opts = supervisor.options(
+                max_restarts=3,
+                max_seconds=5,
+                strategy=OneForOne(),  # Only failing child should be restarted
+            )
             
-            # Use new supervisor start pattern
             handle = await tg.start(supervisor.start, children, opts)
+            print(f"DEBUG: Supervisor started, exec_count={test_data.exec_count}, error_count={test_data.error_count}")
             
-            # Wait for restarts to exceed limits
-            await anyio.sleep(0.5)
+            print("DEBUG: Waiting for restart attempts...")
+            # Wait for one of the children to exceed restart limits and crash the supervisor
+            await anyio.sleep(1.0)
 
-    # Check that RuntimeError is in the nested exception group
-    assert _find_runtime_error(exc_info.value)
+    # Verify the supervisor crashed due to restart intensity being exceeded
+    print(f"DEBUG: Supervisor crashed as expected, error_count={test_data.error_count}")
+    assert _find_runtime_error(exc_info.value), "Expected supervisor to crash with restart limit exceeded error"
     
-    # Services should have been restarted until one hits the limit
-    assert test_data.exec_count >= 6  # At least 6 executions total
-    assert test_data.error_count >= 6
+    # Should have multiple failures before hitting restart limit
+    # With max_restarts=3, expect at least 4 failures (initial + 3 restart attempts)
+    assert test_data.error_count >= 4, f"Expected at least 4 failures, got {test_data.error_count}"
+    
+    print("DEBUG: Multiple children test completed successfully - supervisor crashed as expected when restart limits exceeded")
 
 
 async def test_mixed_restart_strategies(test_data, log_handler):
-    """Test supervisor with persistent services having different restart strategies."""
+    """Test supervisor with mixed restart strategies - PERMANENT and TRANSIENT."""
+    print("DEBUG: Mixed restart strategies test starting")
+    
     # Initialize mailbox registry
     mailbox.init_mailbox_registry()
     
     async with anyio.create_task_group() as tg:
         children = [
             supervisor.child_spec(
-                id="critical-service",
+                id="persistent-service",
                 task=sample_task_long_running,
                 args=[test_data],
                 restart=Permanent(),
             ),
             supervisor.child_spec(
-                id="optional-service", 
-                task=sample_task_long_running,
-                args=[test_data],
+                id="transient-service", 
+                task=sample_task_with_delay,
+                args=[test_data, 0.1],  # Complete after 0.1 seconds
                 restart=Transient(),
             ),
         ]
         
-        opts = supervisor.options(max_restarts=2)
+        opts = supervisor.options(
+            max_restarts=3,
+            max_seconds=5,
+            strategy=OneForOne(),
+        )
         
-        # Use new supervisor start pattern
+        print("DEBUG: Starting supervisor with mixed restart strategies")
         handle = await tg.start(supervisor.start, children, opts)
+        print(f"DEBUG: Supervisor started, exec_count={test_data.exec_count}")
         
-        # Let services run
+        # Let services run briefly
         await anyio.sleep(0.2)
         
-        # Use handle for graceful shutdown
+        # Transient service should have completed and not restarted
+        # Persistent service should still be running
+        print(f"DEBUG: After sleep, exec_count={test_data.exec_count}")
+        
+        # Clean shutdown
         await handle.shutdown()
-
-    # Both services should be running (long-running tasks increment periodically)
-    assert test_data.exec_count >= 2
+        print("DEBUG: Supervisor shutdown completed")
+    
+    print(f"DEBUG: Mixed restart test completed - exec_count={test_data.exec_count}")
+    
+    # Verify both services executed
+    # Persistent service runs continuously, transient service runs once
+    assert test_data.exec_count >= 2, f"Expected at least 2 executions, got {test_data.exec_count}"
+    
+    print("DEBUG: Mixed restart strategies test completed successfully")

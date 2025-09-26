@@ -7,14 +7,16 @@ from otpylib.types import Permanent, Transient
 pytestmark = pytest.mark.anyio
 
 
-async def worker_pool_manager():
+async def worker_pool_manager(*, task_status):
     """Example task that manages a worker pool."""
+    task_status.started()
     # This would normally manage worker allocation
     await anyio.sleep(0.1)
 
 
-async def worker_task(worker_id: int):
+async def worker_task(worker_id: int, *, task_status):
     """Example worker task."""
+    task_status.started()
     await anyio.sleep(0.05)
     return f"worker-{worker_id}-done"
 

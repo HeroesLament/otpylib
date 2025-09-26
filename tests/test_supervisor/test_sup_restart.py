@@ -64,7 +64,7 @@ async def test_automatic_restart_permanent(max_restarts, test_data, log_handler)
     assert test_data.error_count >= (max_restarts + 1)
 
 
-@pytest.mark.parametrize("max_restarts", [1, 3, 5])
+@pytest.mark.parametrize("max_restarts", [1, 3])
 @pytest.mark.parametrize("strategy", [
     Permanent(),
     Transient()

@@ -3,15 +3,17 @@
 import anyio
 
 
-async def sample_task(test_data):
+async def sample_task(test_data, *, task_status):
     """Long-running task that just increments counter forever."""
+    task_status.started()
     while True:
         test_data.exec_count += 1
         await anyio.sleep(0.05)  # simulate ongoing work
 
 
-async def sample_task_error(test_data):
+async def sample_task_error(test_data, *, task_status):
     """Task that increments counter then raises error repeatedly."""
+    task_status.started()
     while True:
         test_data.exec_count += 1
         test_data.error_count += 1
@@ -19,21 +21,24 @@ async def sample_task_error(test_data):
         raise RuntimeError("pytest")
 
 
-async def sample_task_long_running(test_data):
+async def sample_task_long_running(test_data, *, task_status):
     """Explicit long-running task that never exits."""
+    task_status.started()
     while True:
         test_data.exec_count += 1
-        await anyio.sleep_forever()
+        await anyio.sleep(0.1)  # Simulate work while other tasks run
 
 
-async def sample_task_with_delay(test_data, delay=0.1):
+async def sample_task_with_delay(test_data, delay=0.1, *, task_status):
     """Task that runs with a delay, then repeats forever."""
+    task_status.started()
     while True:
         test_data.exec_count += 1
         await anyio.sleep(delay)
 
 
-async def sample_task_with_completion(test_data):
+async def sample_task_with_completion(test_data, *, task_status):
     """Task that runs once, signals completion, and then stops."""
+    task_status.started()
     test_data.exec_count += 1
     test_data.completed.set()

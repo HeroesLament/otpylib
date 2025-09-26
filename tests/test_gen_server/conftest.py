@@ -26,6 +26,7 @@ async def mailbox_env():
     # Cleanup if needed
 
 
+
 @pytest.fixture
 async def test_state(mailbox_env):
     """Provide test state for gen_server tests."""
@@ -34,14 +35,8 @@ async def test_state(mailbox_env):
     test_state = GenServerTestState()
 
     async with anyio.create_task_group() as tg:
-        tg.start_soon(sample_kvstore.start, test_state)
-
-        with anyio.move_on_after(1.0) as cancel_scope:
-            await test_state.ready.wait()
-        
-        if cancel_scope.cancelled_caught:
-            pytest.fail("GenServer failed to start within timeout")
-
+        # Use structured concurrency - this will block until task_status.started()
+        await tg.start(sample_kvstore.start, test_state)
         yield test_state
 
         # Cleanup
@@ -50,7 +45,6 @@ async def test_state(mailbox_env):
             await anyio.sleep(0.1)
         except Exception:
             pass
-
 
 @pytest.fixture(autouse=True)
 def clean_genserver_state():

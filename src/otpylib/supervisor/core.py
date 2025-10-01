@@ -153,7 +153,6 @@ async def list_children(sup_pid: str):
     await process.send(sup_pid, (LIST_CHILDREN, me))
     return await process.receive()
 
-
 async def start(
     child_specs: List[child_spec],
     opts: options = options(),
@@ -162,6 +161,7 @@ async def start(
     """Start supervisor and wait for init handshake (OTP style)."""
     if name and process.whereis(name) is not None:
         raise RuntimeError(f"Supervisor name '{name}' is already registered")
+
     parent = process.self()
     sup_pid = await process.spawn(
         _supervisor_loop,
@@ -169,11 +169,11 @@ async def start(
         name=name,
         mailbox=True,
     )
-    if name:
-        self._name_registry[name] = pid
+
     # Handshake: request init, wait for ack
     await process.send(sup_pid, ("INIT", parent))
     msg = await process.receive(timeout=5.0)
+
     match msg:
         case ("ok", pid, child_ids) if pid == sup_pid:
             return sup_pid

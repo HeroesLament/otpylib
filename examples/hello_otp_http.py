@@ -21,7 +21,7 @@ from otpylib.runtime.registry import set_runtime
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger(__name__)
 
 print("\n=== Example: OTP Hello World HTTP server ===")
@@ -124,7 +124,7 @@ async def start_http_sup():
         ),
     ]
     opts = supervisor.options(strategy=supervisor.ONE_FOR_ONE)
-    sup_pid = await supervisor.start(children, opts, name="http_sup")
+    sup_pid = await supervisor.start(children, opts, name="http_super")
     logger.info(f"[http_sup] started as {sup_pid}")
     return sup_pid
 

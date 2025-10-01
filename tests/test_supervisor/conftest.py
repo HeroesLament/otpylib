@@ -3,7 +3,7 @@ Conftest for supervisor tests.
 """
 import gc
 import pytest
-import anyio
+import asyncio
 from otpylib.runtime import set_runtime, reset_runtime
 from otpylib.runtime.backends.asyncio_backend import AsyncIOBackend
 
@@ -13,7 +13,7 @@ class TestData:
     def __init__(self):
         self.exec_count = 0
         self.error_count = 0
-        self.completed = anyio.Event()
+        self.completed = asyncio.Event()
 
 
 @pytest.fixture(scope="function", autouse=True)

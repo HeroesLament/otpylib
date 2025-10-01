@@ -1,14 +1,14 @@
 import pytest
-import anyio
+import asyncio
 import sys
 from io import StringIO
 
-from otpylib import mailbox, application, logging
+from otpylib import logging
 from loguru import logger
 
 
 # Mark all async tests to use anyio
-pytestmark = pytest.mark.anyio
+pytestmark = pytest.mark.asyncio
 
 
 # Configure to test with asyncio backend only
@@ -41,11 +41,3 @@ def log_handler():
     # Cleanup: remove test handler and reset to defaults
     logger.remove(handler_id)
     logging.configure_logging()  # Reset to default configuration
-
-
-@pytest.fixture
-def mailbox_env():
-    """Initialize mailbox system for tests."""
-    mailbox.init_mailbox_registry()
-    yield
-    # Cleanup could go here if needed

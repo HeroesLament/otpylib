@@ -4,10 +4,8 @@ Shared types and classes for otpylib modules.
 This module contains common types and utility classes used across
 multiple otpylib modules to avoid circular imports.
 """
-
+import asyncio
 from dataclasses import dataclass
-
-import anyio
 from typing import Any, Optional, Union
 
 
@@ -111,7 +109,7 @@ class StartupSync:
     """Helper for coordinating task startup across anyio backends."""
     
     def __init__(self):
-        self._ready = anyio.Event()
+        self._ready = asyncio.Event()
         self._result = None
         self._error = None
     
@@ -149,4 +147,4 @@ def is_cancellation_exception(exception: BaseException) -> bool:
 # Backend-aware sleep function for tenacity
 async def anyio_sleep(seconds: float) -> None:
     """Sleep function compatible with anyio backends."""
-    await anyio.sleep(seconds)
+    await asyncio.sleep(seconds)

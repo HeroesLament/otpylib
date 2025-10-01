@@ -1,5 +1,4 @@
 import pytest
-from otpylib import mailbox
 from otpylib import process
 from otpylib.dynamic_supervisor import (
     start,
@@ -19,7 +18,6 @@ pytestmark = pytest.mark.asyncio
 
 async def test_start_multiple_children(test_data, log_handler):
     async def body():
-        mailbox.init_mailbox_registry()
         sup_pid = await start([], options(), name="test-multiple-children")
         handle = DynamicSupervisorHandle(sup_pid)
 
@@ -41,7 +39,6 @@ async def test_start_multiple_children(test_data, log_handler):
 
 async def test_terminate_specific_child(test_data, log_handler):
     async def body():
-        mailbox.init_mailbox_registry()
         sup_pid = await start([], options(), name="test-terminate-child")
         handle = DynamicSupervisorHandle(sup_pid)
 
@@ -69,7 +66,6 @@ async def test_terminate_specific_child(test_data, log_handler):
 
 async def test_replace_child_with_same_id(test_data, log_handler):
     async def body():
-        mailbox.init_mailbox_registry()
         sup_pid = await start([], options(), name="test-replace-child")
         handle = DynamicSupervisorHandle(sup_pid)
 

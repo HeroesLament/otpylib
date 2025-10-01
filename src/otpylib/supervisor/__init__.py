@@ -1,19 +1,64 @@
 """
-otpylib - OTP-style concurrency patterns for Python with AnyIO.
+Supervisor module for OTPyLib.
 
-This library provides Erlang/OTP-inspired concurrency patterns for Python,
-built on top of the AnyIO async framework.
+Provides process supervision with restart strategies.
 """
 
-# Core supervisor functionality
-from .core import (
+from otpylib.supervisor.core import (
+    start,
+    start_link,
+    get_child_status,
+    list_children,
     child_spec,
     options,
-    start,
+    SupervisorHandle
+)
+
+from otpylib.supervisor.atoms import (
+    # Restart strategies
+    PERMANENT,
+    TRANSIENT,
+    TEMPORARY,
+    
+    # Supervisor strategies
+    ONE_FOR_ONE,
+    ONE_FOR_ALL,
+    REST_FOR_ONE,
+    
+    # Exit reasons
+    NORMAL,
+    SHUTDOWN,
+    KILLED,
+    SUPERVISOR_SHUTDOWN,
+    SIBLING_RESTART_LIMIT
 )
 
 __all__ = [
-    "child_spec",
-    "options",
-    "start",
+    # Functions
+    'start',
+    'start_link',
+    'get_child_status',
+    'list_children',
+    
+    # Classes
+    'child_spec',
+    'options',
+    'SupervisorHandle',
+    
+    # Atoms - Restart strategies
+    'PERMANENT',
+    'TRANSIENT', 
+    'TEMPORARY',
+    
+    # Atoms - Supervisor strategies
+    'ONE_FOR_ONE',
+    'ONE_FOR_ALL',
+    'REST_FOR_ONE',
+    
+    # Atoms - Exit reasons
+    'NORMAL',
+    'SHUTDOWN',
+    'KILLED',
+    'SUPERVISOR_SHUTDOWN',
+    'SIBLING_RESTART_LIMIT'
 ]

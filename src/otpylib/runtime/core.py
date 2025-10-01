@@ -1,30 +1,56 @@
 """
-Runtime Core
+Runtime Backend Core
 
-Defines the abstract RuntimeBackend interface that all runtime implementations
-must implement. Provides the contract for spawning, managing, and communicating
-with OTP processes in a backend-agnostic way.
+Abstract base class for runtime backends with full process management,
+monitoring, and linking capabilities.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union
 from types import ModuleType
+from typing import Any, Dict, List, Optional, Union, Set
+import time
+import logging
 
-from .data import (
-    ProcessType, ProcessInfo, RuntimeStatistics, SimpleChildSpec,
-    ProcessCharacteristics, RuntimeError, ProcessNotFoundError,
-    NameAlreadyRegisteredError, ProcessSpawnError
+# Import data structures
+from otpylib.runtime.data import (
+    ProcessInfo, RuntimeStatistics, SimpleChildSpec,
+    SupervisorOptions, ProcessCharacteristics, MonitorRef,
+    ProcessLink
 )
+
+# Import atoms from centralized definitions
+from otpylib.runtime.atoms import (
+    GEN_SERVER, SUPERVISOR, WORKER,
+    RUNNING, TERMINATED,
+    NORMAL
+)
+
+logger = logging.getLogger(__name__)
+
+
+def validate_gen_server_module(module: ModuleType) -> None:
+    """Validate that a module has required gen_server callbacks."""
+    required_callbacks = ['init', 'handle_call']
+    
+    for callback in required_callbacks:
+        if not hasattr(module, callback):
+            raise ValueError(f"Module {module.__name__} missing required callback: {callback}")
 
 
 class RuntimeBackend(ABC):
     """
-    Abstract base class for runtime backends.
+    Abstract base class for runtime backend implementations.
     
-    Defines the interface that all runtime implementations (AnyIO, SPAM, etc.)
-    must provide. This allows transparent switching between different runtime
-    backends while maintaining the same API for user code.
+    A runtime backend manages process lifecycle, message passing, and
+    fault tolerance primitives (monitors, links) for OTP patterns.
     """
+    
+    def __init__(self):
+        self._startup_time = time.time()
+    
+    # =========================================================================
+    # Process Lifecycle Management
+    # =========================================================================
     
     @abstractmethod
     async def spawn_gen_server(
@@ -37,17 +63,15 @@ class RuntimeBackend(ABC):
         characteristics: Optional[ProcessCharacteristics] = None
     ) -> str:
         """
-        Spawn a gen_server process.
+        Spawn a new gen_server process.
         
-        :param module: Module containing gen_server callbacks (init, handle_call, etc.)
-        :param init_arg: Argument passed to the init callback
-        :param name: Optional name to register the process under
-        :param supervisor_context: Internal supervisor context for state recovery
-        :param recovered_state: Pre-existing state for process recovery
-        :param characteristics: Performance hints for backend optimization
-        :returns: Process ID of the spawned gen_server
-        :raises ProcessSpawnError: If spawning fails
-        :raises NameAlreadyRegisteredError: If name is already taken
+        :param module: Module containing gen_server callbacks
+        :param init_arg: Argument passed to init callback
+        :param name: Optional registered name for the process
+        :param supervisor_context: PID of supervisor if supervised
+        :param recovered_state: State to restore after crash
+        :param characteristics: Hints for backend optimization
+        :returns: PID of the spawned process
         """
         pass
     
@@ -55,22 +79,20 @@ class RuntimeBackend(ABC):
     async def spawn_supervisor(
         self,
         child_specs: List[SimpleChildSpec],
-        supervisor_options: Dict[str, Any],
+        supervisor_options: SupervisorOptions,
         name: Optional[str] = None,
         supervisor_context: Optional[str] = None,
         characteristics: Optional[ProcessCharacteristics] = None
     ) -> str:
         """
-        Spawn a supervisor process.
+        Spawn a new supervisor process.
         
-        :param child_specs: List of child process specifications
-        :param supervisor_options: Supervisor configuration (restart strategy, etc.)
-        :param name: Optional name to register the supervisor under
-        :param supervisor_context: Parent supervisor context
-        :param characteristics: Performance hints for backend optimization
-        :returns: Process ID of the spawned supervisor
-        :raises ProcessSpawnError: If spawning fails
-        :raises NameAlreadyRegisteredError: If name is already taken
+        :param child_specs: List of child specifications
+        :param supervisor_options: Supervisor configuration
+        :param name: Optional registered name
+        :param supervisor_context: Parent supervisor PID if nested
+        :param characteristics: Backend optimization hints
+        :returns: PID of the spawned supervisor
         """
         pass
     
@@ -84,18 +106,140 @@ class RuntimeBackend(ABC):
         characteristics: Optional[ProcessCharacteristics] = None
     ) -> str:
         """
-        Spawn a worker process.
+        Spawn a worker process (plain async or sync function).
         
-        :param worker_func: Function to execute as worker
-        :param args: Arguments to pass to worker function
-        :param name: Optional name to register the worker under
-        :param supervisor_context: Supervisor context for restart management
-        :param characteristics: Performance hints for backend optimization
-        :returns: Process ID of the spawned worker
-        :raises ProcessSpawnError: If spawning fails
-        :raises NameAlreadyRegisteredError: If name is already taken
+        :param worker_func: Function to run as a process
+        :param args: Arguments to pass to the function
+        :param name: Optional registered name
+        :param supervisor_context: Supervisor PID if supervised
+        :param characteristics: Backend optimization hints
+        :returns: PID of the spawned worker
         """
         pass
+    
+    @abstractmethod
+    async def terminate_process(
+        self,
+        pid: str,
+        reason: Any = NORMAL
+    ) -> bool:
+        """
+        Terminate a process with the given reason.
+        
+        :param pid: Process ID to terminate
+        :param reason: Exit reason (atom or exception)
+        :returns: True if process was terminated, False if not found
+        """
+        pass
+    
+    # =========================================================================
+    # Process Monitoring & Linking
+    # =========================================================================
+    
+    @abstractmethod
+    async def monitor_process(
+        self,
+        watcher_pid: str,
+        target_pid: str
+    ) -> str:
+        """
+        Create a monitor from watcher to target process.
+        
+        When target dies, watcher receives a DOWN message.
+        
+        :param watcher_pid: Process that will receive DOWN message
+        :param target_pid: Process being monitored
+        :returns: Monitor reference ID
+        """
+        pass
+    
+    @abstractmethod
+    async def demonitor(
+        self,
+        monitor_ref: str,
+        flush: bool = False
+    ) -> bool:
+        """
+        Remove a monitor.
+        
+        :param monitor_ref: Monitor reference to remove
+        :param flush: If True, remove any pending DOWN messages
+        :returns: True if monitor was removed, False if not found
+        """
+        pass
+    
+    @abstractmethod
+    async def link_processes(
+        self,
+        pid1: str,
+        pid2: str
+    ) -> bool:
+        """
+        Create bidirectional link between processes.
+        
+        If one dies, the other receives exit signal (or dies if not trapping).
+        
+        :param pid1: First process ID
+        :param pid2: Second process ID
+        :returns: True if link created, False if processes don't exist
+        """
+        pass
+    
+    @abstractmethod
+    async def unlink_processes(
+        self,
+        pid1: str,
+        pid2: str
+    ) -> bool:
+        """
+        Remove link between processes.
+        
+        :param pid1: First process ID
+        :param pid2: Second process ID
+        :returns: True if link removed, False if not found
+        """
+        pass
+    
+    @abstractmethod
+    async def trap_exits(
+        self,
+        pid: str,
+        enabled: bool
+    ) -> bool:
+        """
+        Enable/disable exit signal trapping for a process.
+        
+        When enabled, exit signals become EXIT messages instead of killing.
+        
+        :param pid: Process ID
+        :param enabled: True to trap exits, False for normal behavior
+        :returns: True if setting changed, False if process not found
+        """
+        pass
+    
+    @abstractmethod
+    def get_process_links(self, pid: str) -> Set[str]:
+        """
+        Get all processes linked to the given process.
+        
+        :param pid: Process ID
+        :returns: Set of linked process PIDs
+        """
+        pass
+    
+    @abstractmethod
+    def get_process_monitors(self, pid: str) -> Dict[str, str]:
+        """
+        Get all monitors for a process.
+        
+        :param pid: Process ID
+        :returns: Dict of monitor_ref -> target_pid
+        """
+        pass
+    
+    # =========================================================================
+    # Message Passing
+    # =========================================================================
     
     @abstractmethod
     async def call_process(
@@ -105,14 +249,12 @@ class RuntimeBackend(ABC):
         timeout: Optional[float] = None
     ) -> Any:
         """
-        Make a synchronous call to a process.
+        Make a synchronous call to a process (gen_server:call).
         
-        :param target: Process name, PID, or mailbox ID to call
+        :param target: Process PID or registered name
         :param message: Message to send
-        :param timeout: Optional timeout for the call
-        :returns: Response from the target process
-        :raises ProcessNotFoundError: If target process doesn't exist
-        :raises TimeoutError: If call times out
+        :param timeout: Optional timeout in seconds
+        :returns: Response from the process
         """
         pass
     
@@ -123,12 +265,11 @@ class RuntimeBackend(ABC):
         message: Any
     ) -> bool:
         """
-        Send an asynchronous message to a process.
+        Send an asynchronous cast to a process (gen_server:cast).
         
-        :param target: Process name, PID, or mailbox ID to send to
+        :param target: Process PID or registered name
         :param message: Message to send
-        :returns: True if message was sent successfully
-        :raises ProcessNotFoundError: If target process doesn't exist
+        :returns: True if sent successfully
         """
         pass
     
@@ -139,80 +280,94 @@ class RuntimeBackend(ABC):
         message: Any
     ) -> bool:
         """
-        Send a raw message directly to a process mailbox.
+        Send a raw message to a process mailbox.
         
-        :param target: Process name, PID, or mailbox ID to send to
+        :param target: Process PID or registered name
         :param message: Message to send
-        :returns: True if message was sent successfully
-        :raises ProcessNotFoundError: If target process doesn't exist
+        :returns: True if sent successfully
         """
         pass
     
+    # =========================================================================
+    # Process Registry
+    # =========================================================================
+    
     @abstractmethod
-    async def terminate_process(
+    async def register_name(
         self,
-        pid: str,
-        reason: str = "normal"
+        name: str,
+        pid: str
     ) -> bool:
-        """
-        Terminate a specific process.
-        
-        :param pid: Process ID to terminate
-        :param reason: Reason for termination
-        :returns: True if process was terminated successfully
-        :raises ProcessNotFoundError: If process doesn't exist
-        """
-        pass
-    
-    @abstractmethod
-    def is_process_alive(self, pid: str) -> bool:
-        """
-        Check if a process is currently alive.
-        
-        :param pid: Process ID to check
-        :returns: True if process is alive
-        """
-        pass
-    
-    @abstractmethod
-    async def register_name(self, name: str, pid: str) -> bool:
         """
         Register a name for a process.
         
         :param name: Name to register
-        :param pid: Process ID to associate with the name
-        :returns: True if registration succeeded
-        :raises NameAlreadyRegisteredError: If name is already registered
-        :raises ProcessNotFoundError: If PID doesn't exist
+        :param pid: Process ID
+        :returns: True if registered, False if name already taken
         """
         pass
     
     @abstractmethod
-    async def unregister_name(self, name: str) -> bool:
+    async def unregister_name(
+        self,
+        name: str
+    ) -> bool:
         """
         Unregister a name.
         
         :param name: Name to unregister
-        :returns: True if unregistration succeeded
+        :returns: True if unregistered, False if not found
         """
         pass
     
     @abstractmethod
-    def whereis_name(self, name: str) -> Optional[str]:
+    def whereis_name(
+        self,
+        name: str
+    ) -> Optional[str]:
         """
-        Look up a process ID by registered name.
+        Look up a PID by registered name.
         
-        :param name: Name to look up
-        :returns: Process ID if found, None otherwise
+        :param name: Registered name
+        :returns: PID if found, None otherwise
         """
         pass
     
     @abstractmethod
-    def get_process_info(self, pid: str) -> Optional[ProcessInfo]:
+    def registered_names(self) -> List[str]:
+        """
+        Get all registered names.
+        
+        :returns: List of all registered names
+        """
+        pass
+    
+    # =========================================================================
+    # Process Inspection
+    # =========================================================================
+    
+    @abstractmethod
+    def is_process_alive(
+        self,
+        pid: str
+    ) -> bool:
+        """
+        Check if a process is alive.
+        
+        :param pid: Process ID
+        :returns: True if alive, False otherwise
+        """
+        pass
+    
+    @abstractmethod
+    def get_process_info(
+        self,
+        pid: str
+    ) -> Optional[ProcessInfo]:
         """
         Get detailed information about a process.
         
-        :param pid: Process ID to get info for
+        :param pid: Process ID
         :returns: ProcessInfo if found, None otherwise
         """
         pass
@@ -220,139 +375,115 @@ class RuntimeBackend(ABC):
     @abstractmethod
     def list_processes(
         self,
-        process_type: Optional[ProcessType] = None
+        process_type: Optional[Any] = None
     ) -> List[ProcessInfo]:
         """
         List all processes, optionally filtered by type.
         
-        :param process_type: Optional filter by process type
-        :returns: List of ProcessInfo objects
+        :param process_type: Optional atom to filter by (e.g., PROCESS_GEN_SERVER)
+        :returns: List of process information
         """
         pass
     
     @abstractmethod
     def get_statistics(self) -> RuntimeStatistics:
         """
-        Get runtime performance statistics.
+        Get runtime statistics and metrics.
         
-        :returns: RuntimeStatistics object with performance metrics
+        :returns: RuntimeStatistics object with current metrics
         """
         pass
+    
+    # =========================================================================
+    # Mailbox Integration
+    # =========================================================================
+    
+    @abstractmethod
+    async def associate_mailbox(
+        self,
+        pid: str,
+        mailbox_id: str
+    ) -> bool:
+        """
+        Associate a mailbox with a process for automatic cleanup.
+        
+        When the process dies, its mailbox will be automatically destroyed.
+        
+        :param pid: Process ID
+        :param mailbox_id: Mailbox ID to associate
+        :returns: True if associated, False if process not found
+        """
+        pass
+    
+    @abstractmethod
+    async def dissociate_mailbox(
+        self,
+        pid: str
+    ) -> Optional[str]:
+        """
+        Remove mailbox association from a process.
+        
+        :param pid: Process ID
+        :returns: Mailbox ID that was dissociated, or None
+        """
+        pass
+    
+    # =========================================================================
+    # Utility Methods
+    # =========================================================================
+    
+    def get_uptime(self) -> float:
+        """Get backend uptime in seconds."""
+        return time.time() - self._startup_time
+    
+    def _validate_process_name(self, name: str) -> None:
+        """Validate a process name is valid."""
+        if not name or not isinstance(name, str):
+            raise ValueError("Process name must be a non-empty string")
+        if len(name) > 255:
+            raise ValueError("Process name too long (max 255 chars)")
+    
+    def _validate_pid(self, pid: str) -> None:
+        """Validate a PID format."""
+        if not pid or not isinstance(pid, str):
+            raise ValueError("PID must be a non-empty string")
+    
+    def _normalize_target(self, target: Union[str, Any]) -> str:
+        """Normalize a target to a string (PID or name)."""
+        if hasattr(target, '__name__'):
+            return target.__name__
+        return str(target)
 
 
 class BaseRuntimeBackend(RuntimeBackend):
     """
-    Base implementation providing common functionality for runtime backends.
+    Base implementation with common functionality.
     
-    Provides shared utilities and validation that concrete backends can use.
-    Concrete backends should inherit from this and implement the abstract methods.
+    Concrete backends can inherit from this to get standard implementations
+    of some methods while focusing on their unique aspects.
     """
     
     def __init__(self):
-        self._startup_time = 0.0
-        
-    def _validate_process_name(self, name: str) -> None:
-        """Validate a process name."""
-        if not name:
-            raise ValueError("Process name cannot be empty")
-        if not isinstance(name, str):
-            raise TypeError("Process name must be a string")
-        if len(name) > 255:
-            raise ValueError("Process name too long (max 255 characters)")
-        if name.startswith('_'):
-            raise ValueError("Process name cannot start with underscore")
-    
-    def _validate_pid(self, pid: str) -> None:
-        """Validate a process ID."""
-        if not pid:
-            raise ValueError("Process ID cannot be empty")
-        if not isinstance(pid, str):
-            raise TypeError("Process ID must be a string")
-    
-    def _normalize_target(self, target: Union[str, Any]) -> str:
-        """
-        Normalize a target (name, PID, or mailbox ID) to a consistent format.
-        
-        :param target: Target identifier
-        :returns: Normalized target string
-        """
-        if isinstance(target, str):
-            return target
-        # Handle mailbox IDs or other target types - convert to string
-        return str(target)
+        super().__init__()
+        self._monitors: Dict[str, MonitorRef] = {}  # ref -> MonitorRef
+        self._links: Set[ProcessLink] = set()
     
     def _create_process_info(
         self,
         pid: str,
-        process_type: ProcessType,
+        process_type: Any,
         name: Optional[str] = None,
-        **kwargs
+        state: Any = RUNNING,
+        characteristics: Optional[ProcessCharacteristics] = None,
+        supervisor_context: Optional[str] = None
     ) -> ProcessInfo:
-        """Create a ProcessInfo object with common defaults."""
-        import time
+        """Helper to create ProcessInfo with defaults."""
         return ProcessInfo(
             pid=pid,
             process_type=process_type,
             name=name,
-            state=kwargs.get('state', None),
+            state=state,
             created_at=time.time(),
-            message_queue_length=kwargs.get('message_queue_length', 0),
-            restart_count=kwargs.get('restart_count', 0),
-            last_active=kwargs.get('last_active'),
-            characteristics=kwargs.get('characteristics'),
-            supervisor_pid=kwargs.get('supervisor_pid'),
-            supervisor_context=kwargs.get('supervisor_context')
+            characteristics=characteristics,
+            supervisor_pid=supervisor_context
         )
-    
-    def get_uptime(self) -> float:
-        """Get runtime uptime in seconds."""
-        import time
-        return time.time() - self._startup_time if self._startup_time else 0.0
-
-
-# Utility functions for runtime backends
-
-def validate_module_callbacks(module: ModuleType, required_callbacks: List[str]) -> None:
-    """
-    Validate that a module has required callback functions.
-    
-    :param module: Module to validate
-    :param required_callbacks: List of required callback names
-    :raises ValueError: If required callbacks are missing
-    """
-    missing = []
-    for callback in required_callbacks:
-        if not hasattr(module, callback):
-            missing.append(callback)
-    
-    if missing:
-        raise ValueError(f"Module missing required callbacks: {', '.join(missing)}")
-
-
-def validate_gen_server_module(module: ModuleType) -> None:
-    """
-    Validate that a module is suitable for use as a gen_server.
-    
-    :param module: Module to validate
-    :raises ValueError: If module is invalid
-    """
-    # Only 'init' is strictly required - others have defaults in gen_server
-    validate_module_callbacks(module, ['init'])
-    
-    # Validate callback signatures if present
-    if hasattr(module, 'handle_call'):
-        # Could add signature validation here if needed
-        pass
-
-
-def validate_supervisor_options(options: Dict[str, Any]) -> None:
-    """
-    Validate supervisor options.
-    
-    :param options: Options dictionary to validate
-    :raises ValueError: If options are invalid
-    """
-    # Add validation for supervisor options
-    # For now, just ensure it's a dict
-    if not isinstance(options, dict):
-        raise TypeError("Supervisor options must be a dictionary")

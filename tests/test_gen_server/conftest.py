@@ -1,64 +1,34 @@
-import pytest
-import anyio
-from otpylib.mailbox.core import init_mailbox_registry
+"""
+Minimal conftest for gen_server tests.
+"""
+import pytest_asyncio
+from otpylib.runtime import set_runtime, reset_runtime
+from otpylib.runtime.backends.asyncio_backend import AsyncIOBackend
 
 
-class GenServerTestState:
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def runtime_backend():
+    """Set up runtime backend once per test session."""
+    backend = AsyncIOBackend()
+    await backend.initialize()
+    set_runtime(backend)
+    yield
+    await backend.shutdown()
+    reset_runtime()
+
+
+class TestState:
+    """Simple state container for gen_server tests."""
     def __init__(self):
-        self.ready = anyio.Event()
-        self.stopped = anyio.Event()
-        self.info = anyio.Event()
-        self.casted = anyio.Event()
-
         self.data = {}
-        self.did_raise = None
-        self.terminated_with = None
-
-        self.info_val = None
-        self.unknown_info = []
-
-
-@pytest.fixture
-async def mailbox_env():
-    """Initialize mailbox system for tests."""
-    init_mailbox_registry()
-    yield
-    # Cleanup if needed
+        self.events = []
+        self.messages = []
+        self.counter = 0
+        self.terminated = False
+        self.terminate_reason = None
 
 
-
-@pytest.fixture
-async def test_state(mailbox_env):
-    """Provide test state for gen_server tests."""
-    from . import sample_kvstore
-    
-    test_state = GenServerTestState()
-
-    async with anyio.create_task_group() as tg:
-        # Use structured concurrency - this will block until task_status.started()
-        await tg.start(sample_kvstore.start, test_state)
-        yield test_state
-
-        # Cleanup
-        try:
-            await sample_kvstore.special_cast.stop()
-            await anyio.sleep(0.1)
-        except Exception:
-            pass
-
-@pytest.fixture(autouse=True)
-def clean_genserver_state():
-    """Clean gen_server global state before and after each test."""
-    from otpylib.gen_server import core as gen_server_core
-    
-    # Clear before test
-    gen_server_core._PENDING_CALLS.clear()
-    gen_server_core._GENSERVER_STATES.clear()
-    gen_server_core._CALL_COUNTER = 0
-    
-    yield
-    
-    # Clear after test
-    gen_server_core._PENDING_CALLS.clear()
-    gen_server_core._GENSERVER_STATES.clear()
-    gen_server_core._CALL_COUNTER = 0
+@pytest_asyncio.fixture
+async def test_state():
+    """Provide fresh test state for each test."""
+    return TestState()

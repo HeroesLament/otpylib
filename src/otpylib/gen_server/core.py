@@ -1,213 +1,60 @@
 """
-A generic server is an abstraction of a server loop built on top of the mailbox
-module.
+Generic Server using Process API
 
-It is best used to build components that accept request from other components in
-your application such as:
-
- - an in-memory key-value store
- - a TCP server handler
- - a finite state machine
-
-There are 3 ways of sending messages to a generic server:
-
- - **cast:** send a message
- - **call:** send a message an wait for a response
- - directly to the mailbox
-
-> **NB:** If a call returns an exception to the caller, the exception will be
-> raised on the caller side.
-
-.. code-block:: python
-   :caption: Example
-
-   from otpylib import gen_server, mailbox
-   import types
-
-
-   # Create module-like object for callbacks
-   callbacks = types.SimpleNamespace()
-
-
-   async def start():
-       await gen_server.start(callbacks, name='kvstore')
-
-
-   async def get(key):
-       return await gen_server.call('kvstore', ('get', key))
-
-
-   async def set(key, val):
-       return await gen_server.call('kvstore', ('set', key, val))
-
-
-   async def stop():
-       await gen_server.cast('kvstore', 'stop')
-
-
-   async def printstate():
-       await mailbox.send('kvstore', 'printstate')
-
-   # gen_server callbacks
-
-   async def init(_init_arg):
-       state = {}
-       return state
-
-   callbacks.init = init
-
-
-   # optional
-   async def terminate(reason, state):
-       if reason is not None:
-           print('An error occured:', reason)
-
-       print('Exited with state:', state)
-
-   callbacks.terminate = terminate
-
-
-   # if not defined, the gen_server will stop with a NotImplementedError when
-   # receiving a call
-   async def handle_call(message, _caller, state):
-       match message:
-           case ('get', key):
-               val = state.get(key, None)
-               return (gen_server.Reply(payload=val), state)
-
-           case ('set', key, val):
-               prev = state.get(key, None)
-               state[key] = val
-               return (gen_server.Reply(payload=prev), state)
-
-           case _:
-               exc = NotImplementedError('unknown request')
-               return (gen_server.Reply(payload=exc), state)
-
-   callbacks.handle_call = handle_call
-
-
-   # if not defined, the gen_server will stop with a NotImplementedError when
-   # receiving a cast
-   async def handle_cast(message, state):
-       match message:
-           case 'stop':
-               return (gen_server.Stop(), state)
-
-           case _:
-               print('unknown request')
-               return (gen_server.NoReply(), state)
-
-   callbacks.handle_cast = handle_cast
-
-
-   # optional
-   async def handle_info(message, state):
-       match message:
-           case 'printstate':
-               print(state)
-
-           case _:
-               pass
-
-       return (gen_server.NoReply(), state)
-
-   callbacks.handle_info = handle_info
+Strict BEAM-aligned: no global state registry.  
+Each GenServer owns its own state; other processes cannot reach in.
 """
 
-from typing import TypeVar, Union, Optional, Any, Tuple, Dict, Set
+from typing import Callable, TypeVar, Union, Optional, Any, Dict
 from types import ModuleType
 import logging
 import time
 import uuid
+import asyncio
 from dataclasses import dataclass
 
-import anyio
-import anyio.abc
-
-from otpylib import mailbox
+from otpylib import process
+from otpylib.gen_server.atoms import (
+    STOP_ACTION,
+    CRASH,
+)
 
 State = TypeVar("State")
 
-# Global registries for transparent restart support
-_PENDING_CALLS: Dict[str, Dict[str, Any]] = {}  # Survives GenServer death
-_GENSERVER_STATES: Dict[str, Dict[str, Any]] = {}  # State preservation by unique key
-_CALL_COUNTER = 0  # For unique call IDs
+# Only needed for bridging calls outside process context
+_PENDING_CALLS: Dict[str, asyncio.Future] = {}
+_CALL_COUNTER = 0
 
-# Runtime integration - cached for performance
-_CACHED_RUNTIME = None
-_CACHE_VALID = False
-
-def _get_cached_runtime():
-    """Get cached runtime backend with lazy loading."""
-    global _CACHED_RUNTIME, _CACHE_VALID
-    if not _CACHE_VALID:
-        try:
-            from otpylib.runtime import get_runtime
-            _CACHED_RUNTIME = get_runtime()
-        except ImportError:
-            # Runtime module not available - use mailbox fallback
-            _CACHED_RUNTIME = None
-        _CACHE_VALID = True
-    return _CACHED_RUNTIME
-
-def _invalidate_runtime_cache():
-    """Invalidate runtime cache when backend changes."""
-    global _CACHE_VALID
-    _CACHE_VALID = False
+logger = logging.getLogger(__name__)
 
 
 class GenServerExited(Exception):
-    """
-    Raised when the generic server exited during a call.
-    """
-
-
-@dataclass
-class _Loop:
-    yes: bool
-
-
-@dataclass
-class _Raise:
-    exc: BaseException
-
-
-Continuation = Union[_Loop, _Raise]
+    """Raised when the generic server exited during a call."""
+    def __init__(self, reason: Any = None):
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass
 class Reply:
-    """
-    Return an instance of this class to send a reply to the caller.
-    """
-
-    payload: Any  #: The response to send back
+    payload: Any
 
 
 @dataclass
 class NoReply:
-    """
-    Return an instance of this class to not send a reply to the caller.
-    """
+    pass
 
 
 @dataclass
 class Stop:
-    """
-    Return an instance of this class to stop the generic server.
-    """
-
-    reason: Optional[BaseException] = (
-        None  #: Eventual exception that caused the gen_server to stop
-    )
+    reason: Any = STOP_ACTION
 
 
 @dataclass
 class _CallMessage:
-    source: anyio.abc.ObjectSendStream
+    reply_to: str
     payload: Any
-    call_id: Optional[str] = None  # Optional for enhanced tracking
+    call_id: str
 
 
 @dataclass
@@ -215,456 +62,274 @@ class _CastMessage:
     payload: Any
 
 
-def _generate_state_key(name: Optional[str], supervisor_context: Optional[str] = None) -> Optional[str]:
-    """
-    Generate a unique state storage key.
-    
-    Returns None if state recovery should not be enabled (no name and no context).
-    """
-    if supervisor_context:
-        # For supervised gen_servers, include supervisor context
-        if name:
-            return f"{supervisor_context}:{name}"
-        else:
-            return f"{supervisor_context}:anonymous"
-    elif name:
-        # Standalone gen_server with name
-        return f"standalone:{name}"
-    else:
-        # Anonymous gen_server without supervisor - no state recovery
-        return None
-
+# ============================================================================
+# Public API
+# ============================================================================
 
 async def start(
     module: ModuleType,
     init_arg: Optional[Any] = None,
     name: Optional[str] = None,
-    _recovered_state: Optional[Dict[str, Any]] = None,  # For direct state injection
-    _supervisor_context: Optional[str] = None,  # For unique state key generation
-    *,
-    task_status: anyio.abc.TaskStatus,
-) -> None:
-    """
-    Starts the generic server loop.
+) -> str:
+    if name is None:
+        name = module.__name__
 
-    :param module: Module containing the generic server's callbacks
-    :param init_arg: Optional argument passed to the `init` callback
-    :param name: Optional name to use to register the generic server's mailbox
-    :param _recovered_state: Internal parameter for direct state recovery
-    :param _supervisor_context: Internal parameter for supervisor-based state recovery
-    :param task_status: Task status for structured concurrency coordination
+    pid = await process.spawn(
+        _gen_server_loop,
+        args=[module, init_arg],
+        name=name,
+        mailbox=True,
+    )
+    logger.debug(f"[gen_server.start] module={module}, name={name}, pid={pid}")
+    return pid
 
-    :raises otpylib.mailbox.NameAlreadyExist: If the `name` was already registered
-    :raises Exception: If the generic server terminated with a non-null reason
-    """
-    
-    # Check if we should delegate to runtime backend
-    runtime = _get_cached_runtime()
-    if runtime:
-        # Delegate to runtime backend
-        return await runtime.spawn_gen_server(
-            module, 
-            init_arg, 
-            name,
-            supervisor_context=_supervisor_context,
-            recovered_state=_recovered_state
-        )
-    
-    # Fallback to original mailbox-based implementation
-    await _loop(module, init_arg, name, _recovered_state, _supervisor_context, task_status)
+
+async def start_link(
+    module: ModuleType,
+    init_arg: Optional[Any] = None,
+    name: Optional[str] = None,
+) -> str:
+    """BEAM-style GenServer.start_link/3 equivalent."""
+    if name is None:
+        name = module.__name__
+
+    pid = await process.spawn_link(
+        _gen_server_loop,
+        args=[module, init_arg],
+        name=name,
+        mailbox=True,
+    )
+    logger.debug(f"[gen_server.start_link] module={module}, name={name}, pid={pid}")
+    return pid
 
 
 async def call(
-    name_or_mid: Union[str, mailbox.MailboxID],
+    target: Union[str, str],
     payload: Any,
     timeout: Optional[float] = None,
 ) -> Any:
-    """
-    Send a request to the generic server and wait for a response.
-
-    This function creates a temporary bi-directional channel. The writer is
-    passed to the `handle_call` function and is used to send the response back
-    to the caller.
-
-    :param name_or_mid: The generic server's mailbox identifier
-    :param payload: The message to send to the generic server
-    :param timeout: Optional timeout after which this function fails
-    :returns: The response from the generic server
-    :raises GenServerExited: If the generic server exited after handling the call
-    :raises Exception: If the response is an exception
-
-    """
-    # Check if we should delegate to runtime backend
-    runtime = _get_cached_runtime()
-    if runtime:
-        # Delegate to runtime backend
-        return await runtime.call_process(name_or_mid, payload, timeout)
-    
-    # Original mailbox-based implementation
     global _CALL_COUNTER
-    
-    # Generate unique call ID for tracking
     _CALL_COUNTER += 1
     call_id = f"call_{_CALL_COUNTER}_{uuid.uuid4().hex[:8]}"
-    
-    # Create response channel with buffer to avoid immediate closure issues
-    send_stream, receive_stream = anyio.create_memory_object_stream[Union[Exception, Any]](1)
-    
-    # Register call for potential recovery
-    _PENDING_CALLS[call_id] = {
-        'send_stream': send_stream,
-        'payload': payload,
-        'name_or_mid': name_or_mid,
-        'timestamp': time.time(),
-    }
-    
-    # Send message with both stream and call ID
-    message = _CallMessage(source=send_stream, payload=payload, call_id=call_id)
-    await mailbox.send(name_or_mid, message)
 
+    caller_pid = process.self()
+    if caller_pid:
+        return await _call_from_process(target, payload, timeout, call_id, caller_pid)
+    else:
+        return await _call_from_outside_process(target, payload, timeout, call_id)
+
+
+async def cast(target: Union[str, str], payload: Any) -> None:
+    message = _CastMessage(payload=payload)
+    logger.debug(f"[gen_server.cast] target={target}, payload={payload}")
+    await process.send(target, message)
+
+
+async def reply(caller: Union[str, Callable], response: Any) -> None:
+    if callable(caller):
+        await caller(response)
+    else:
+        await process.send(caller, response)
+
+
+# ============================================================================
+# Internal helpers
+# ============================================================================
+
+async def _call_from_process(
+    target: str,
+    payload: Any,
+    timeout: Optional[float],
+    call_id: str,
+    caller_pid: str,
+) -> Any:
+    ref = await process.monitor(target)
     try:
-        if timeout is not None:
-            with anyio.move_on_after(timeout) as cancel_scope:
-                val = await receive_stream.receive()
-                
-            if cancel_scope.cancelled_caught:
-                raise TimeoutError("Gen server call timed out")
-        else:
-            val = await receive_stream.receive()
+        message = _CallMessage(reply_to=caller_pid, payload=payload, call_id=call_id)
+        await process.send(target, message)
+        logger.debug(f"[gen_server._call_from_process] sent call_id={call_id} to {target}")
 
-        if isinstance(val, Exception):
-            raise val
+        start_time = time.time()
+        while True:
+            remaining_timeout = None
+            if timeout:
+                elapsed = time.time() - start_time
+                remaining_timeout = timeout - elapsed
+                if remaining_timeout <= 0:
+                    raise TimeoutError("GenServer call timed out")
 
-        return val
+            try:
+                reply = await process.receive(timeout=remaining_timeout)
+            except TimeoutError:
+                raise TimeoutError("GenServer call timed out")
+
+            if isinstance(reply, tuple) and len(reply) == 2 and reply[0] == call_id:
+                _, result = reply
+                logger.debug(f"[gen_server._call_from_process] got reply for call_id={call_id}: {result}")
+                if isinstance(result, Exception):
+                    if isinstance(result, GenServerExited):
+                        raise result  # preserve stop/crash/etc.
+                    else:
+                        raise result  # real Python exception
+                return result
+
+            if (
+                isinstance(reply, tuple)
+                and len(reply) == 4
+                and reply[0] == "DOWN"
+                and reply[1] == ref
+                and reply[2] == target
+            ):
+                reason = reply[3]
+                logger.debug(f"[gen_server._call_from_process] target {target} died mid-call, reason={reason}")
+                raise GenServerExited(reason)
 
     finally:
-        # Clean up registration
-        _PENDING_CALLS.pop(call_id, None)
-        await send_stream.aclose()
-        await receive_stream.aclose()
+        await process.demonitor(ref, flush=True)
 
 
-async def cast(
-    name_or_mid: Union[str, mailbox.MailboxID],
+async def _call_from_outside_process(
+    target: str,
     payload: Any,
-) -> None:
-    """
-    Send a message to the generic server without expecting a response.
+    timeout: Optional[float],
+    call_id: str,
+) -> Any:
+    future = asyncio.Future()
+    _PENDING_CALLS[call_id] = future
 
-    :param name_or_mid: The generic server's mailbox identifier
-    :param payload: The message to send
-    """
-    
-    # Check if we should delegate to runtime backend
-    runtime = _get_cached_runtime()
-    if runtime:
-        # Delegate to runtime backend
-        return await runtime.cast_process(name_or_mid, payload)
-
-    # Original mailbox-based implementation
-    message = _CastMessage(payload=payload)
-    await mailbox.send(name_or_mid, message)
-
-
-async def reply(caller: anyio.abc.ObjectSendStream, response: Any) -> None:
-    """
-    The `handle_call` callback can start a background task to handle a slow
-    request and return a `NoReply` instance. Use this function in the background
-    task to send the response to the caller at a later time.
-
-    :param caller: The caller SendStream to use to send the response
-    :param response: The response to send back to the caller
-
-    .. code-block:: python
-       :caption: Example
-
-       from otpylib import gen_server, supervisor, dynamic_supervisor
-       import anyio
-
-
-       async def slow_task(message, caller):
-           # do stuff with message
-           await gen_server.reply(caller, response)
-
-
-       async def handle_call(message, caller, state):
-           await dynamic_supervisor.start_child(
-               'slow-task-pool',
-               supervisor.child_spec(
-                   id='some-slow-task',
-                   task=slow_task,
-                   args=[message, caller],
-                   restart=supervisor.restart_strategy.TEMPORARY,
-               ),
-           )
-
-           return (gen_server.NoReply(), state)
-    """
-    
-    try:
-        await caller.send(response)
-    except (anyio.ClosedResourceError, anyio.BrokenResourceError):
-        # Caller timed out or disconnected, that's OK
-        pass
-
-
-# Rest of the implementation remains the same...
-async def _loop(
-    module: ModuleType,
-    init_arg: Optional[Any],
-    name: Optional[str],
-    _recovered_state: Optional[Dict[str, Any]],
-    _supervisor_context: Optional[str],
-    task_status: anyio.abc.TaskStatus,
-) -> None:
-    # Generate unique state key if applicable
-    state_key = _generate_state_key(name, _supervisor_context)
-    
-    async with mailbox.open(name) as mid:
-        processing_calls: Set[str] = set()  # Track in-flight calls
-        
+    async def bridge_process():
         try:
-            # Initialize or recover state
-            if _recovered_state is not None:
-                # Direct state injection provided
-                state = _recovered_state['state']
-                pending_calls = _recovered_state.get('pending_calls', [])
-                
-                # Re-inject pending calls into mailbox for reprocessing
-                for call_id in pending_calls:
-                    if call_id in _PENDING_CALLS:
-                        call_info = _PENDING_CALLS[call_id]
-                        # Re-send the original message
-                        message = _CallMessage(
-                            source=call_info['send_stream'],
-                            payload=call_info['payload'],
-                            call_id=call_id
-                        )
-                        await mailbox.send(mid, message)
-                
-                # Optional: notify module of recovery
-                if hasattr(module, 'on_recovery'):
-                    state = await module.on_recovery(state)
-                    
-            elif state_key and state_key in _GENSERVER_STATES:
-                # Check for auto-saved state
-                saved = _GENSERVER_STATES[state_key]
-                state = saved['state']
-                pending_calls = saved.get('pending_calls', [])
-                
-                # Re-inject pending calls
-                for call_id in pending_calls:
-                    if call_id in _PENDING_CALLS:
-                        call_info = _PENDING_CALLS[call_id]
-                        message = _CallMessage(
-                            source=call_info['send_stream'],
-                            payload=call_info['payload'],
-                            call_id=call_id
-                        )
-                        await mailbox.send(mid, message)
-                
-                # Clear the saved state now that we've recovered
-                del _GENSERVER_STATES[state_key]
-                
-                # Optional recovery callback
-                if hasattr(module, 'on_recovery'):
-                    state = await module.on_recovery(state)
-            else:
-                # Normal initialization
-                state = await _init(module, init_arg)
-            
-            # Signal that the gen_server is ready to handle messages
-            task_status.started()
-            
-            looping = True
+            result = await _call_from_process(target, payload, timeout, call_id, process.self())
+            if not future.done():
+                future.set_result(result)
+        except Exception as e:
+            if not future.done():
+                future.set_exception(e)
+        finally:
+            _PENDING_CALLS.pop(call_id, None)
 
-            while looping:
-                message = await mailbox.receive(mid)
+    await process.spawn(bridge_process)
 
-                match message:
-                    case _CallMessage(source, payload, call_id):
-                        if call_id:
-                            processing_calls.add(call_id)
-                        continuation, state = await _handle_call(
-                            module, payload, source, state
-                        )
-                        if call_id:
-                            processing_calls.discard(call_id)
-
-                    case _CastMessage(payload):
-                        continuation, state = await _handle_cast(module, payload, state)
-
-                    case _:
-                        continuation, state = await _handle_info(module, message, state)
-
-                match continuation:
-                    case _Loop(yes=False):
-                        looping = False
-
-                    case _Loop(yes=True):
-                        looping = True
-
-                    case _Raise(exc=err):
-                        raise err
-
-        except Exception as err:
-            # Save state for potential restart if we have a state key
-            if state_key:
-                _GENSERVER_STATES[state_key] = {
-                    'state': state,
-                    'pending_calls': list(processing_calls),
-                    'timestamp': time.time(),
-                }
-            await _terminate(module, err, state)
-            raise err from None
-
+    try:
+        if timeout:
+            return await asyncio.wait_for(future, timeout)
         else:
-            # Clean shutdown - clear saved state if exists
-            if state_key and state_key in _GENSERVER_STATES:
-                del _GENSERVER_STATES[state_key]
-            await _terminate(module, None, state)
+            return await future
+    except asyncio.TimeoutError:
+        raise TimeoutError("GenServer call timed out")
 
 
-async def _init(module: ModuleType, init_arg: Any) -> State:
-    return await module.init(init_arg)
+async def _gen_server_loop(module, init_arg):
+    """Main GenServer loop, owns its state privately."""
+    init_fn = getattr(module, "init", None)
+    if init_fn is not None:
+        state = await init_fn(init_arg)
+    else:
+        state = None
+
+    try:
+        while True:
+            message = await process.receive()
+
+            if isinstance(message, _CallMessage):
+                state = await _handle_call(module, message, state)
+            elif isinstance(message, _CastMessage):
+                state = await _handle_cast(module, message, state)
+            else:
+                state = await _handle_info(module, message, state)
+
+    except GenServerExited as e:
+        # 🔑 Proper BEAM semantics: stop/crash reasons propagate literally
+        try:
+            await _terminate(module, e.reason, state)
+        except Exception:
+            logger.error("[gen_server.loop] terminate callback raised", exc_info=True)
+        raise
+
+    except Exception as e:
+        # 🔑 Unexpected Python exception → normalize to crash
+        try:
+            await _terminate(module, CRASH, state)
+        except Exception:
+            logger.error("[gen_server.loop] terminate callback raised", exc_info=True)
+        logger.error("[gen_server.loop] crashed with %s", e, exc_info=True)
+        raise GenServerExited(CRASH)
 
 
-async def _terminate(
-    module: ModuleType,
-    reason: Optional[BaseException],
-    state: State,
-) -> None:
-    handler = getattr(module, "terminate", None)
-    if handler is not None:
-        await handler(reason, state)
+# ============================================================================
+# Message handlers
+# ============================================================================
 
-    elif reason is not None:
-        logger = logging.getLogger(f"otpylib.gen_server.{module.__name__}")
-        logger.exception("Gen server terminated with exception", exc_info=reason)
-
-
-async def _handle_call(
-    module: ModuleType,
-    message: Any,
-    source: anyio.abc.ObjectSendStream,
-    state: State,
-) -> Tuple[Continuation, State]:
+async def _handle_call(module: ModuleType, message: _CallMessage, state: Any) -> Any:
     handler = getattr(module, "handle_call", None)
     if handler is None:
-        raise NotImplementedError(f"{module.__name__}.handle_call")
+        error = NotImplementedError("handle_call not implemented")
+        await process.send(message.reply_to, (message.call_id, error))
+        return state
 
-    result = await handler(message, source, state)
-    continuation: Union[_Loop, _Raise]
+    async def reply_fn(payload):
+        await process.send(message.reply_to, (message.call_id, payload))
+
+    result = await handler(message.payload, reply_fn, state)
 
     match result:
         case (Reply(payload), new_state):
-            state = new_state
-            await reply(source, payload)
-            continuation = _Loop(yes=True)
-
+            await process.send(message.reply_to, (message.call_id, payload))
+            return new_state
         case (NoReply(), new_state):
-            state = new_state
-            continuation = _Loop(yes=True)
-
+            return new_state
         case (Stop(reason), new_state):
-            state = new_state
-            await reply(source, GenServerExited())
-
-            if reason is not None:
-                continuation = _Raise(reason)
-            else:
-                continuation = _Loop(yes=False)
-
+            await process.send(message.reply_to, (message.call_id, GenServerExited(reason)))
+            raise GenServerExited(reason)
         case _:
-            raise TypeError(
-                f"{module.__name__}.handle_call did not return a valid value"
-            )
-
-    return continuation, state
+            raise TypeError(f"Invalid handle_call return value: {result}")
 
 
-async def _handle_cast(
-    module: ModuleType,
-    message: Any,
-    state: State,
-) -> Tuple[Continuation, State]:
+async def _handle_cast(module: ModuleType, message: Any, state: Any) -> Any:
     handler = getattr(module, "handle_cast", None)
     if handler is None:
-        raise NotImplementedError(f"{module.__name__}.handle_cast")
+        raise NotImplementedError("handle_cast not implemented")
 
     result = await handler(message, state)
-    continuation: Union[_Loop, _Raise]
 
     match result:
         case (NoReply(), new_state):
-            state = new_state
-            continuation = _Loop(yes=True)
-
+            return new_state
         case (Stop(reason), new_state):
-            state = new_state
-
-            if reason is not None:
-                continuation = _Raise(reason)
-            else:
-                continuation = _Loop(yes=False)
-
+            reason_atom = reason or STOP_ACTION
+            raise GenServerExited(reason_atom)
         case _:
-            raise TypeError(
-                f"{module.__name__}.handle_cast did not return a valid value"
-            )
-
-    return continuation, state
+            raise TypeError(f"Invalid handle_cast return value: {result}")
 
 
-async def _handle_info(
-    module: ModuleType,
-    message: Any,
-    state: State,
-) -> Tuple[Continuation, State]:
+async def _handle_info(module: ModuleType, message: Any, state: Any) -> Any:
     handler = getattr(module, "handle_info", None)
     if handler is None:
-        return _Loop(yes=True), state
+        return state
 
     result = await handler(message, state)
-    continuation: Union[_Loop, _Raise]
 
     match result:
         case (NoReply(), new_state):
-            state = new_state
-            continuation = _Loop(yes=True)
-
+            return new_state
         case (Stop(reason), new_state):
-            state = new_state
-
-            if reason is not None:
-                continuation = _Raise(reason)
-            else:
-                continuation = _Loop(yes=False)
-
+            reason_atom = reason or STOP_ACTION
+            raise GenServerExited(reason_atom)
         case _:
-            raise TypeError(
-                f"{module.__name__}.handle_info did not return a valid value"
-            )
-
-    return continuation, state
+            raise TypeError(f"Invalid handle_info return value: {result}")
 
 
-# Public function to enable supervisor integration
-def get_saved_state(state_key: str) -> Optional[Dict[str, Any]]:
-    """
-    Get saved state for a GenServer by its unique state key.
-    
-    :param state_key: The unique state key
-    :returns: Saved state dict or None if not found
-    """
-    return _GENSERVER_STATES.get(state_key)
+# ============================================================================
+# Termination
+# ============================================================================
 
+async def _terminate(module, reason, state):
+    handler = getattr(module, "terminate", None)
 
-def clear_saved_state(state_key: str) -> None:
-    """
-    Clear saved state for a GenServer.
-    
-    :param state_key: The unique state key
-    """
-    if state_key in _GENSERVER_STATES:
-        del _GENSERVER_STATES[state_key]
+    if handler is not None:
+        try:
+            await handler(reason, state)
+        except Exception as e:
+            logger.error(f"Error in terminate handler: {e}", exc_info=True)
+    elif reason is not None:
+        logger.error(f"GenServer terminated with reason={reason}", exc_info=True)

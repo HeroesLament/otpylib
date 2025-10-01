@@ -8,12 +8,15 @@ from .data import Atom, AtomError, AtomNotFound
 from .core import (
     ensure, 
     exists,
-    name,
-    id,
+    by_name,
+    by_id,
     ensure_many,
+    from_list,
     all_atoms,
     atom_count,
-    clear
+    clear,
+    name,
+    id,
 )
 
 __all__ = [
@@ -24,11 +27,16 @@ __all__ = [
     
     # Core functions
     'ensure',
-    'exists', 
-    'name',
-    'id',
+    'exists',
+    'by_name',
+    'by_id',
     'ensure_many',
+    'from_list',
     'all_atoms',
     'atom_count',
     'clear',
+    
+    # Legacy compatibility
+    'name',
+    'id',
 ]

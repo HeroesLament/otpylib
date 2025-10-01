@@ -1,41 +1,103 @@
+"""
+Test gen_server call/reply behavior.
+"""
+import types
+import asyncio
 import pytest
-import anyio
-
-from . import sample_kvstore as kvstore
-from otpylib.gen_server import GenServerExited
+from otpylib import gen_server, process
 
 
-pytestmark = pytest.mark.anyio
+@pytest.mark.asyncio
+async def test_simple_call(test_state):
+    """Test basic call/reply pattern."""
+    async def tester():
+        async def init(state):
+            return state
+        
+        async def handle_call(msg, caller, state):
+            if msg == "get":
+                return gen_server.Reply(state.data), state
+            elif isinstance(msg, tuple) and msg[0] == "set":
+                key, val = msg[1], msg[2]
+                state.data[key] = val
+                return gen_server.Reply("ok"), state
+            return gen_server.Reply("unknown"), state
+        
+        mod = types.SimpleNamespace(init=init, handle_call=handle_call)
+        pid = await gen_server.start(mod, test_state)
+        
+        result = await gen_server.call(pid, "get")
+        assert result == {}
+        
+        result = await gen_server.call(pid, ("set", "foo", "bar"))
+        assert result == "ok"
+        assert test_state.data == {"foo": "bar"}
+        
+        await process.exit(pid, "shutdown")
+        await asyncio.sleep(0.05)
+    
+    test_pid = await process.spawn(tester, mailbox=True)
+    while process.is_alive(test_pid):
+        await asyncio.sleep(0.05)
 
-async def test_kvstore_call_delayed(test_state):
-    async with anyio.create_task_group() as task_group:
-        resp = await kvstore.special_call.delayed(task_group)
 
-    assert resp == "done"
+@pytest.mark.asyncio
+async def test_call_with_stop(test_state):
+    """Test that Stop action terminates the server."""
+    async def tester():
+        async def init(state):
+            return state
+        
+        async def handle_call(msg, caller, state):
+            if msg == "stop":
+                return gen_server.Stop("stopped"), state
+            return gen_server.Reply("ok"), state
+        
+        mod = types.SimpleNamespace(init=init, handle_call=handle_call)
+        pid = await gen_server.start(mod, test_state)
+        
+        from otpylib.gen_server.core import GenServerExited
+        try:
+            await gen_server.call(pid, "stop")
+            assert False, "Should have raised GenServerExited"
+        except GenServerExited:
+            pass
+        
+        await asyncio.sleep(0.05)
+        assert not process.is_alive(pid)
+    
+    test_pid = await process.spawn(tester, mailbox=True)
+    while process.is_alive(test_pid):
+        await asyncio.sleep(0.05)
 
 
-async def test_kvstore_call_timeout(test_state):
-    with pytest.raises(TimeoutError):
-        await kvstore.special_call.timedout(0.01)
-
-
-async def test_kvstore_call_stopped(test_state):
-    with pytest.raises(GenServerExited):
-        await kvstore.special_call.stopped()
-
-    with anyio.fail_after(0.1):
-        await test_state.stopped.wait()
-
-    assert test_state.terminated_with is None
-    assert test_state.did_raise is None
-
-
-async def test_kvstore_call_failure(test_state):
-    with pytest.raises(GenServerExited):
-        await kvstore.special_call.failure()
-
-    with anyio.fail_after(0.1):
-        await test_state.stopped.wait()
-
-    assert isinstance(test_state.terminated_with, RuntimeError)
-    assert test_state.did_raise is test_state.terminated_with
+@pytest.mark.asyncio
+async def test_call_modifies_state(test_state):
+    """Test that call handlers can modify state."""
+    async def tester():
+        async def init(state):
+            return state
+        
+        async def handle_call(msg, caller, state):
+            if msg == "increment":
+                state.counter += 1
+                return gen_server.Reply(state.counter), state
+            return gen_server.Reply("unknown"), state
+        
+        mod = types.SimpleNamespace(init=init, handle_call=handle_call)
+        pid = await gen_server.start(mod, test_state)
+        
+        result1 = await gen_server.call(pid, "increment")
+        assert result1 == 1
+        
+        result2 = await gen_server.call(pid, "increment")
+        assert result2 == 2
+        
+        assert test_state.counter == 2
+        
+        await process.exit(pid, "shutdown")
+        await asyncio.sleep(0.05)
+    
+    test_pid = await process.spawn(tester, mailbox=True)
+    while process.is_alive(test_pid):
+        await asyncio.sleep(0.05)

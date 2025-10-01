@@ -3,7 +3,7 @@
 
 from typing import List, Dict, Optional, Iterable
 from .table import AtomTable
-from .data import AtomImpl, Atom
+from .data import Atom
 
 # Global atom table singleton
 _table = AtomTable()

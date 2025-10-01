@@ -1,192 +1,201 @@
-import anyio
-import types
-import pytest
+"""
+Sample KVStore implemented as a gen_server for testing.
+"""
 
+import sys
+import asyncio
 from otpylib.helpers import current_module
-from otpylib import gen_server, mailbox
+from otpylib import gen_server, process
+from otpylib.gen_server.atoms import STOP_ACTION, CRASH, TERMINATED
 
+# Fixed, explicit name for registration
+SERVER_NAME = "tests.test_gen_server.sample_kvstore"
 __module__ = current_module()
 
+# =====================================================================
+# Lifecycle
+# =====================================================================
 
-pytestmark = pytest.mark.anyio
-
-
-async def start(test_state, *, task_status):
-    try:
-        callbacks = create_callbacks()
-        await gen_server.start(callbacks, test_state, name=__name__, task_status=task_status)
-
-    except Exception as err:
-        test_state.did_raise = err
-
-    finally:
-        test_state.stopped.set()
+async def init(test_state):
+    """Initialize state."""
+    test_state.ready.set()
+    return test_state
 
 
-def create_callbacks():
-    """Create gen_server callbacks namespace."""
-    callbacks = types.SimpleNamespace()
-    
-    async def init(test_state):
-        test_state.ready.set()
-        return test_state
+async def terminate(reason, test_state):
+    """Run on shutdown."""
+    test_state.terminated_with = reason or TERMINATED
+    test_state.stopped.set()
 
-    async def terminate(reason, test_state):
-        test_state.terminated_with = reason
+# =====================================================================
+# Callbacks
+# =====================================================================
 
-    async def handle_call(message, caller, test_state):
-        match message:
-            case ("api_get", key):
-                val = test_state.data.get(key)
-                return (gen_server.Reply(payload=val), test_state)
+async def handle_call(message, caller, test_state):
+    payload = getattr(message, "payload", message)
 
-            case ("api_set", key, val):
-                prev = test_state.data.get(key)
-                test_state.data[key] = val
-                return (gen_server.Reply(payload=prev), test_state)
+    match payload:
+        case ("api_get", key):
+            val = test_state.data.get(key)
+            return (gen_server.Reply(payload=val), test_state)
 
-            case "api_clear":
-                test_state.data.clear()
-                return (gen_server.Reply(payload=None), test_state)
+        case ("api_set", key, val):
+            prev = test_state.data.get(key)
+            test_state.data[key] = val
+            return (gen_server.Reply(payload=prev), test_state)
 
-            case ("special_call_delayed", task_group):
-                async def slow_task():
-                    await anyio.sleep(0.1)
-                    await gen_server.reply(caller, "done")
+        case "api_clear":
+            test_state.data.clear()
+            return (gen_server.Reply(payload=None), test_state)
 
-                task_group.start_soon(slow_task)
-                return (gen_server.NoReply(), test_state)
+        # Special calls
+        case ("special_call_normal", val):
+            return (gen_server.Reply(payload=f"ok:{val}"), test_state)
 
-            case "special_call_timedout":
-                return (gen_server.NoReply(), test_state)
+        case ("special_call_stopped",):
+            return (gen_server.Stop(STOP_ACTION), test_state)
 
-            case "special_call_stopped":
-                return (gen_server.Stop(), test_state)
+        case ("special_call_failure",):
+            return (gen_server.Stop(CRASH), test_state)
 
-            case "special_call_failure":
-                exc = RuntimeError("pytest")
-                return (gen_server.Stop(exc), test_state)
+        case _:
+            return (gen_server.Reply(payload=("error", "wrong_call")), test_state)
 
-            case _:
-                exc = NotImplementedError("wrong call")
-                return (gen_server.Reply(payload=exc), test_state)
 
-    async def handle_cast(message, test_state):
-        match message:
-            case "special_cast_normal":
-                test_state.casted.set()
-                return (gen_server.NoReply(), test_state)
+async def handle_cast(message, test_state):
+    payload = getattr(message, "payload", message)
 
-            case "special_cast_stop":
-                return (gen_server.Stop(), test_state)
+    match payload:
+        case "special_cast_normal":
+            test_state.casted.set()
+            return (gen_server.NoReply(), test_state)
 
-            case _:
-                exc = NotImplementedError("wrong cast")
-                return (gen_server.Stop(exc), test_state)
+        case "special_cast_stop":
+            test_state.stopped.set()
+            return (gen_server.Stop("stop"), test_state)
 
-    async def handle_info(message, test_state):
-        match message:
-            case ("special_info_matched", val):
-                test_state.info_val = val
-                test_state.info.set()
-                return (gen_server.NoReply(), test_state)
+        case "special_cast_fail":
+            exc = RuntimeError("pytest")
+            return (gen_server.Stop(exc), test_state)
 
-            case "special_info_stop":
-                return (gen_server.Stop(), test_state)
+        case ("stop", _):
+            test_state.stopped.set()
+            return (gen_server.Stop("stop"), test_state)
 
-            case "special_info_fail":
-                exc = RuntimeError("pytest")
-                return (gen_server.Stop(exc), test_state)
+        case _:
+            return (gen_server.NoReply(), test_state)
 
-            case _:
-                test_state.unknown_info.append(message)
-                test_state.info.set()
-                return (gen_server.NoReply(), test_state)
 
-    callbacks.init = init
-    callbacks.terminate = terminate
-    callbacks.handle_call = handle_call
-    callbacks.handle_cast = handle_cast
-    callbacks.handle_info = handle_info
-    
-    return callbacks
+async def handle_info(message, test_state):
+    payload = getattr(message, "payload", message)
+
+    match payload:
+        case ("special_info_matched", val):
+            test_state.info_val = val
+            test_state.info.set()
+            return (gen_server.NoReply(), test_state)
+
+        case "special_info_stop":
+            return (gen_server.Stop(STOP_ACTION), test_state)
+
+        case "special_info_fail":
+            return (gen_server.Stop(CRASH), test_state)
+
+        case _:
+            test_state.unknown_info.append(payload)
+            test_state.info.set()
+            return (gen_server.NoReply(), test_state)
+
+# =====================================================================
+# Bind functions into the module object (BEAM semantics)
+# =====================================================================
+
+this_module = sys.modules[__name__]
+this_module.init = init
+this_module.terminate = terminate
+this_module.handle_call = handle_call
+this_module.handle_cast = handle_cast
+this_module.handle_info = handle_info
+
+# =====================================================================
+# Entry point
+# =====================================================================
+
+async def start(test_state=None) -> str:
+    """Start the KVStore server with this module as callbacks."""
+    from tests.test_gen_server.conftest import GenServerTestState
+
+    if test_state is None:
+        test_state = GenServerTestState()
+
+    pid = await gen_server.start(module=this_module, init_arg=test_state, name=SERVER_NAME)
+    return pid
+
+# =====================================================================
+# Public API for tests
+# =====================================================================
+
+async def call(msg, *, timeout=None):
+    return await gen_server.call(SERVER_NAME, msg, timeout=timeout)
+
+async def cast(msg):
+    return await gen_server.cast(SERVER_NAME, msg)
+
+async def info(msg):
+    return await process.send(SERVER_NAME, msg)
 
 
 class api:
-    """
-    Normal KVStore API
-    """
-
     @staticmethod
     async def get(key):
-        return await gen_server.call(__name__, ("api_get", key))
+        return await gen_server.call(SERVER_NAME, ("api_get", key))
 
     @staticmethod
     async def set(key, val):
-        return await gen_server.call(__name__, ("api_set", key, val))
+        return await gen_server.call(SERVER_NAME, ("api_set", key, val))
 
     @staticmethod
     async def clear():
-        return await gen_server.call(__name__, "api_clear")
+        return await gen_server.call(SERVER_NAME, "api_clear")
 
 
 class special_call:
-    """
-    Special edge cases for gen_server.call
-    """
+    @staticmethod
+    async def normal(val):
+        return await gen_server.call(SERVER_NAME, ("special_call_normal", val))
 
     @staticmethod
-    async def delayed(task_group):
-        return await gen_server.call(__name__, ("special_call_delayed", task_group))
+    async def stop():
+        return await gen_server.call(SERVER_NAME, ("special_call_stopped",))
 
     @staticmethod
-    async def timedout(timeout):
-        return await gen_server.call(__name__, "special_call_timedout", timeout=timeout)
-
-    @staticmethod
-    async def stopped():
-        return await gen_server.call(__name__, "special_call_stopped")
-
-    @staticmethod
-    async def failure():
-        return await gen_server.call(__name__, "special_call_failure")
+    async def fail():
+        return await gen_server.call(SERVER_NAME, ("special_call_failure",))
 
 
 class special_cast:
-    """
-    Special edge cases for gen_server.cast
-    """
-
     @staticmethod
     async def normal():
-        await gen_server.cast(__name__, "special_cast_normal")
+        await gen_server.cast(SERVER_NAME, "special_cast_normal")
 
     @staticmethod
     async def stop():
-        await gen_server.cast(__name__, "special_cast_stop")
+        await gen_server.cast(SERVER_NAME, "special_cast_stop")
 
     @staticmethod
     async def fail():
-        await gen_server.cast(__name__, "special_cast_fail")
+        await gen_server.cast(SERVER_NAME, "special_cast_fail")
 
 
 class special_info:
-    """
-    Special edge cases for direct messages
-    """
-
     @staticmethod
     async def matched(val):
-        await mailbox.send(__name__, ("special_info_matched", val))
-
-    @staticmethod
-    async def no_match(val):
-        await mailbox.send(__name__, ("special_info_no_match", val))
+        await process.send(SERVER_NAME, ("special_info_matched", val))
 
     @staticmethod
     async def stop():
-        await mailbox.send(__name__, "special_info_stop")
+        await process.send(SERVER_NAME, "special_info_stop")
 
     @staticmethod
     async def fail():
-        await mailbox.send(__name__, "special_info_fail")
+        await process.send(SERVER_NAME, "special_info_fail")

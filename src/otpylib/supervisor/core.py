@@ -1,402 +1,369 @@
 """
 Static supervisor for managing persistent, long-running processes.
 
-The static supervisor is designed to manage services that should continuously
-run and be restarted when they fail - things like web servers, database 
-connections, message processors, etc.
-
-ALL supervised functions must have *, task_status: anyio.abc.TaskStatus in their signature.
-This provides consistent structured concurrency and startup coordination.
+Provides BEAM-style supervision strategies with OTP-like restart limits:
+- No normal exits: any child exit not initiated by the supervisor is a fault.
+- Global restart intensity window: every restarted child increments the counter.
 """
 
 from collections.abc import Callable, Awaitable
 from typing import Any, Dict, List, Optional
-import logging
 import time
-
 from collections import deque
 from dataclasses import dataclass, field
 
-import anyio
-import anyio.abc
-from anyio import CancelScope
-from result import Result, Ok, Err
+from otpylib import atom, process
+from otpylib.runtime.backends.base import ProcessNotFoundError
 
-from otpylib.types import (
-    NormalExit, ShutdownExit, BrutalKill, GracefulShutdown, TimedShutdown, 
-    ShutdownStrategy, RestartStrategy, SupervisorStrategy,
-    Permanent, Transient, OneForOne, OneForAll, RestForOne
+from otpylib.supervisor.atoms import (
+    PERMANENT, TRANSIENT, TEMPORARY,
+    ONE_FOR_ONE, ONE_FOR_ALL, REST_FOR_ONE,
+    SUPERVISOR_SHUTDOWN,
+    GET_CHILD_STATUS, LIST_CHILDREN,
+    SHUTDOWN, KILLED,
 )
 
-
-BACKOFF_DELAYS = [0.1, 0.5, 1.0, 2.0, 5.0]
-BACKOFF_RESET_THRESHOLD = 30.0  # seconds
-
-# Type alias for health probe functions
-HealthProbeFunction = Callable[[str, Any], Awaitable[Result[None, str]]]
+# --------------------------------------------------------------------------------------
+# Specs & Options
+# --------------------------------------------------------------------------------------
 
 @dataclass
 class child_spec:
     id: str
-    task: Callable[..., Awaitable[None]]
-    args: List[Any]
-    restart: RestartStrategy = Permanent()
-    shutdown: ShutdownStrategy = TimedShutdown(5000)
-    health_check_enabled: bool = True  # Enable automatic health checking
-    health_check_interval: float = 30.0  # Health check interval in seconds
-    health_check_timeout: float = 5.0   # Health check timeout
-    health_check_fn: Optional[HealthProbeFunction] = None  # Custom health probe function
-    enable_state_recovery: bool = False  # Enable state recovery for gen_servers
+    func: Callable[..., Awaitable[None]]
+    args: List[Any] = field(default_factory=list)
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+    restart: Any = PERMANENT
+    name: Optional[str] = None
 
 
 @dataclass
 class options:
-    """Supervisor options."""
     max_restarts: int = 3
     max_seconds: int = 5
-    strategy: SupervisorStrategy = OneForOne()
-    shutdown_strategy: ShutdownStrategy = TimedShutdown(5000)
+    strategy: Any = ONE_FOR_ONE
 
 
 @dataclass
-class _ChildProcess:
-    """Runtime state of a child."""
+class _ChildState:
     spec: child_spec
-    cancel_scope: CancelScope
-    task: Optional[anyio.abc.TaskGroup] = None
+    pid: Optional[str] = None
+    monitor_ref: Optional[str] = None
     restart_count: int = 0
-    failure_times: deque = field(default_factory=lambda: deque())
-    last_exception: Optional[Exception] = None
-    health_check_failures: int = 0
-    last_health_check: Optional[float] = None
-    supervisor_context: Optional[str] = None
-    backoff_level: int = 0
-    last_successful_start: Optional[float] = None
 
 
-class _SupervisorState:
-    """Shared state for coordinating children."""
-    
-    def __init__(self, specs: List[child_spec], opts: options):
-        self.opts = opts
-        self.children: Dict[str, _ChildProcess] = {}
-        self.start_order: List[str] = []
-        self.task_group: Optional[anyio.abc.TaskGroup] = None
-        self.failed_children: List[tuple[str, Exception]] = []
-        self.shutting_down = False
-        self.supervisor_id = f"sup_{id(self)}_{time.time()}"  # Unique supervisor ID
-        
-        # Initialize children
-        for spec in specs:
-            child = _ChildProcess(
-                spec=spec,
-                cancel_scope=CancelScope()
-            )
-            # Generate supervisor context for state recovery
-            if spec.enable_state_recovery:
-                child.supervisor_context = f"{self.supervisor_id}:{spec.id}"
-            
-            self.children[spec.id] = child
-            self.start_order.append(spec.id)
+class _IntensityExceeded(Exception):
+    pass
 
-    def should_restart_child(self, child_id: str, failed: bool, exception: Optional[Exception] = None) -> tuple[bool, bool]:
-        """Check if a specific child should restart.
-        
-        Returns:
-            tuple[should_restart: bool, limit_exceeded: bool]
-        """
-        child = self.children[child_id]
-        
-        # If shutting down, don't restart
-        if self.shutting_down:
-            return False, False
 
-        # For TRANSIENT: only restart on actual exceptions (not normal completion or NormalExit)
-        if isinstance(child.spec.restart, Transient):
-            if not failed or isinstance(exception, NormalExit):
-                return False, False
+# --------------------------------------------------------------------------------------
+# Utilities
+# --------------------------------------------------------------------------------------
 
-        # Only count actual failures (exceptions that aren't NormalExit) for restart limits
-        if failed and isinstance(exception, Exception) and not isinstance(exception, NormalExit):
-            # Add current failure first
-            current_time = time.time()
-            child.failure_times.append(current_time)
-            
-            # Check restart limit BEFORE time window cleanup to avoid race conditions
-            if len(child.failure_times) > self.opts.max_restarts:
-                return False, True  # Don't restart, limit exceeded
-            
-            # Only AFTER checking limits, clean up old failures for future iterations
-            cutoff_time = current_time - self.opts.max_seconds
-            while child.failure_times and child.failure_times[0] < cutoff_time:
-                child.failure_times.popleft()
+def _record_restart(intensity_times: deque, opts: options) -> bool:
+    """Record a restart attempt and check if intensity exceeded."""
+    now = time.time()
+    intensity_times.append(now)
+    cutoff = now - opts.max_seconds
+    while intensity_times and intensity_times[0] < cutoff:
+        intensity_times.popleft()
+    return len(intensity_times) > opts.max_restarts
 
-        return True, False
 
-    def get_affected_children(self, failed_child_id: str, exceeded_limit: bool) -> List[str]:
-        """Determine which children are affected by a failure."""
-        if not exceeded_limit:
-            return [failed_child_id]  # Just restart the one
-            
-        if isinstance(self.opts.strategy, OneForOne):
-            # Even if limit exceeded, only this child is terminated
-            return [failed_child_id]
-        elif isinstance(self.opts.strategy, OneForAll):
-            # All children must restart
-            return list(self.children.keys())
-        elif isinstance(self.opts.strategy, RestForOne):
-            # This child and all started after it
-            idx = self.start_order.index(failed_child_id)
-            return self.start_order[idx:]
-        else:
-            # Default fallback
-            return [failed_child_id]
+async def _mark_down(child: _ChildState):
+    if child.pid and child.spec.name:
+        try:
+            await process.unregister(child.spec.name)
+        except Exception:
+            pass
+    child.pid = None
+    child.monitor_ref = None
 
+
+def _safe_is_alive(pid: Optional[str]) -> bool:
+    if not pid:
+        return False
+    try:
+        return process.is_alive(pid)
+    except ProcessNotFoundError:
+        return False
+
+
+async def _shutdown_children(children: Dict[str, _ChildState]):
+    for c in children.values():
+        if _safe_is_alive(c.pid):
+            try:
+                await process.exit(c.pid, SUPERVISOR_SHUTDOWN)
+            except ProcessNotFoundError:
+                pass
+
+
+async def _start_child(child: _ChildState):
+    pid, monitor_ref = await process.spawn_monitor(
+        child.spec.func,
+        args=child.spec.args,
+        kwargs=child.spec.kwargs,
+        name=child.spec.name,
+        mailbox=True,
+    )
+    child.pid = pid
+    child.monitor_ref = monitor_ref
+
+
+async def _restart_child(child: _ChildState, intensity_times: deque, opts: options):
+    """Restart a single child with intensity accounting."""
+    if _record_restart(intensity_times, opts):
+        raise _IntensityExceeded()
+
+    await _mark_down(child)
+    child.restart_count += 1
+    await _start_child(child)
+
+
+# --------------------------------------------------------------------------------------
+# Public API
+# --------------------------------------------------------------------------------------
 
 class SupervisorHandle:
-    """Handle for controlling and monitoring a running supervisor."""
-    
-    def __init__(self, state: _SupervisorState):
-        self._state = state
-    
-    def get_child_status(self, child_id: str) -> Optional[_ChildProcess]:
-        """Get status of a specific child."""
-        return self._state.children.get(child_id)
-    
-    def list_children(self) -> List[str]:
-        """Get list of all child IDs."""
-        return list(self._state.children.keys())
-    
-    def get_restart_count(self, child_id: str) -> int:
-        """Get restart count for a specific child."""
-        child = self._state.children.get(child_id)
-        return child.restart_count if child else 0
-    
-    def get_health_status(self, child_id: str) -> Dict[str, Any]:
-        """Get health check status for a child."""
-        child = self._state.children.get(child_id)
-        if not child:
-            return {"error": "Child not found"}
-        
-        return {
-            "health_check_failures": child.health_check_failures,
-            "last_health_check": child.last_health_check,
-            "health_check_enabled": child.spec.health_check_enabled,
-            "has_custom_probe": child.spec.health_check_fn is not None
-        }
-    
-    def is_shutting_down(self) -> bool:
-        """Check if supervisor is shutting down."""
-        return self._state.shutting_down
-    
+    def __init__(self, supervisor_pid: str, state_getter: Callable):
+        self.supervisor_pid = supervisor_pid
+        self._get_state = state_getter
+
+    async def get_child_status(self, child_id: str) -> Optional[Dict[str, Any]]:
+        await process.send(self.supervisor_pid, (GET_CHILD_STATUS, child_id, process.self()))
+        return await process.receive(timeout=5.0)
+
+    async def list_children(self) -> List[str]:
+        await process.send(self.supervisor_pid, (LIST_CHILDREN, process.self()))
+        return await process.receive(timeout=5.0)
+
     async def shutdown(self):
-        """Initiate supervisor shutdown."""
-        self._state.shutting_down = True
-        if self._state.task_group:
-            self._state.task_group.cancel_scope.cancel()
+        await process.exit(self.supervisor_pid, SHUTDOWN)
+
+
+async def get_child_status(sup_pid: str, child_id: str):
+    """Query a supervisor for the status of one child."""
+    me = process.self()
+    await process.send(sup_pid, (GET_CHILD_STATUS, child_id, me))
+    return await process.receive()
+
+async def list_children(sup_pid: str):
+    """Query a supervisor for the list of all child IDs."""
+    me = process.self()
+    await process.send(sup_pid, (LIST_CHILDREN, me))
+    return await process.receive()
 
 
 async def start(
     child_specs: List[child_spec],
-    opts: options,
-    *,
-    task_status: anyio.abc.TaskStatus,
-) -> None:
-    """Start the supervisor with the given children and strategy."""
-    
-    state = _SupervisorState(child_specs, opts)
-    logger = logging.getLogger("otpylib.supervisor")
-    
-    # Create handle for external control
-    handle = SupervisorHandle(state)
-    
-    # Signal supervisor is ready and return the handle
-    task_status.started(handle)
-    
-    try:
-        async with anyio.create_task_group() as tg:
-            state.task_group = tg
-            
-            # Start all children initially
-            for child_id in state.start_order:
-                tg.start_soon(_run_child, state, child_id, logger)
-            
-            # Start health monitoring for children that have probe functions
-            for child_id in state.start_order:
-                child = state.children[child_id]
-                if child.spec.health_check_enabled and child.spec.health_check_fn is not None:
-                    tg.start_soon(_health_monitor, state, child_id, logger)
-            
-            # Continue supervising indefinitely
-            
-    except* Exception as eg:
-        # Re-raise the exception group, which will contain any child failures
-        raise
+    opts: options = options(),
+    name: Optional[str] = None,
+) -> str:
+    """Start supervisor and wait for init handshake (OTP style)."""
+    if name and process.whereis(name) is not None:
+        raise RuntimeError(f"Supervisor name '{name}' is already registered")
+    parent = process.self()
+    sup_pid = await process.spawn(
+        _supervisor_loop,
+        args=[child_specs, opts],
+        name=name,
+        mailbox=True,
+    )
+    if name:
+        self._name_registry[name] = pid
+    # Handshake: request init, wait for ack
+    await process.send(sup_pid, ("INIT", parent))
+    msg = await process.receive(timeout=5.0)
+    match msg:
+        case ("ok", pid, child_ids) if pid == sup_pid:
+            return sup_pid
+        case ("error", reason):
+            raise RuntimeError(f"Supervisor init failed: {reason}")
+        case other:
+            raise RuntimeError(f"Unexpected init reply: {other!r}")
 
 
-async def _health_monitor(state: _SupervisorState, child_id: str, logger: logging.Logger):
-    """Health monitoring using custom probe function."""
-    child = state.children[child_id]
-    
-    if not child.spec.health_check_fn:
-        logger.error(f"Health monitor started but no health_check_fn provided for {child_id}")
-        return
-    
-    logger.debug(f"Starting health monitoring for child: {child_id}")
-    
-    while not state.shutting_down:
+async def start_link(
+    child_specs: List[child_spec],
+    opts: options = options(),
+    name: Optional[str] = None,
+) -> str:
+    """Start supervisor linked to caller, OTP-style handshake."""
+    if name and process.whereis(name) is not None:
+        raise RuntimeError(f"Supervisor name '{name}' is already registered")
+    parent = process.self()
+    sup_pid = await process.spawn_link(
+        _supervisor_loop,
+        args=[child_specs, opts],
+        name=name,
+        mailbox=True,
+    )
+    await process.send(sup_pid, ("INIT", parent))
+    msg = await process.receive(timeout=5.0)
+    match msg:
+        case ("ok", pid, child_ids) if pid == sup_pid:
+            return sup_pid
+        case ("error", reason):
+            raise RuntimeError(f"Supervisor init failed: {reason}")
+        case other:
+            raise RuntimeError(f"Unexpected init reply: {other!r}")
+
+
+# --------------------------------------------------------------------------------------
+# Supervisor loop
+# --------------------------------------------------------------------------------------
+
+async def _supervisor_loop(child_specs: List[child_spec], opts: options):
+    DOWN_ATOM = atom.ensure("DOWN")
+    EXIT_ATOM = atom.ensure("EXIT")
+
+    children: Dict[str, _ChildState] = {}
+    start_order: List[str] = []
+    shutting_down = False
+    intensity_times: deque = deque()
+
+    # ------------------------------------------------------------------
+    # Handshake phase: wait for INIT from parent
+    # ------------------------------------------------------------------
+    while True:
+        msg = await process.receive()
+        match msg:
+            case ("INIT", reply_to):
+                try:
+                    # Build child states
+                    for spec in child_specs:
+                        children[spec.id] = _ChildState(spec=spec)
+                        start_order.append(spec.id)
+
+                    # Start children
+                    for child_id in start_order:
+                        await _start_child(children[child_id])
+
+                    # Ack parent with children list
+                    child_ids = list(children.keys())
+                    await process.send(reply_to, ("ok", process.self(), child_ids))
+                except Exception as e:
+                    await process.send(reply_to, ("error", e))
+                    return  # supervisor dies on init error
+                break  # done with handshake
+            case _:
+                # Ignore anything else until INIT arrives
+                continue
+
+    # ------------------------------------------------------------------
+    # Main supervisor loop
+    # ------------------------------------------------------------------
+    while not shutting_down:
         try:
-            # Call the custom health probe function with timeout
-            with anyio.move_on_after(child.spec.health_check_timeout):
-                probe_result = await child.spec.health_check_fn(child_id, child)
-                
-                if probe_result.is_ok():
-                    # Health check succeeded
-                    child.health_check_failures = 0
-                    child.last_health_check = time.time()
-                    logger.debug(f"Health check passed for {child_id}")
-                else:
-                    # Health check returned an error
-                    child.health_check_failures += 1
-                    error_msg = probe_result.unwrap_err()
-                    logger.warning(f"Health check failed for {child_id} (failure #{child.health_check_failures}): {error_msg}")
-            
-            # If health check fails repeatedly, restart the child
-            if child.health_check_failures >= 3:
-                logger.error(f"Child {child_id} failed 3 health checks, triggering restart")
-                child.cancel_scope.cancel()
-                break
-            
-            # Wait before next check (longer on failure)
-            if child.health_check_failures > 0:
-                await anyio.sleep(5.0)  # Retry sooner on failure
-            else:
-                await anyio.sleep(child.spec.health_check_interval)
-            
-        except anyio.get_cancelled_exc_class():
-            # Timeout occurred
-            child.health_check_failures += 1
-            child.last_health_check = time.time()
-            
-            logger.warning(f"Health check timed out for {child_id} (failure #{child.health_check_failures})")
-            
-        except Exception as e:
-            child.health_check_failures += 1
-            child.last_health_check = time.time()
-            
-            logger.warning(f"Health check exception for {child_id} (failure #{child.health_check_failures}): {e}")
+            msg = await process.receive()
 
+            match msg:
+                # Exit from linked child
+                case (msg_type, from_pid, reason) if msg_type == EXIT_ATOM:
+                    cid = next((cid for cid, ch in children.items() if ch.pid == from_pid), None)
+                    if cid:
+                        await _handle_child_exit(children, cid, reason, opts, start_order, intensity_times)
 
-async def _run_child(state: _SupervisorState, child_id: str, logger: logging.Logger) -> None:
-    """Run and monitor a single child with universal task_status support."""
+                # Monitor DOWN
+                case (msg_type, ref, _, _pid, reason) if msg_type == DOWN_ATOM:
+                    cid = next((cid for cid, ch in children.items() if ch.monitor_ref == ref), None)
+                    if cid and reason != KILLED:
+                        await _handle_child_exit(children, cid, reason, opts, start_order, intensity_times)
 
-    child = state.children[child_id]
-
-    while not state.shutting_down:
-        failed = False
-        exception = None
-        
-        try:
-            with child.cancel_scope:
-                # Check if this is a gen_server with state recovery enabled
-                from otpylib import gen_server
-                
-                if (child.spec.enable_state_recovery and 
-                    child.spec.task == gen_server.start and 
-                    child.supervisor_context):
-                    
-                    # Try state recovery for gen_servers
-                    # Assume args are [module, init_arg, name]
-                    if len(child.spec.args) >= 1:
-                        module = child.spec.args[0]
-                        init_arg = child.spec.args[1] if len(child.spec.args) > 1 else None
-                        name = child.spec.args[2] if len(child.spec.args) > 2 else None
-                        
-                        # Start with supervisor context for state recovery
-                        async with anyio.create_task_group() as child_tg:
-                            async def start_with_context(*, task_status):
-                                await gen_server.start(
-                                    module,
-                                    init_arg,
-                                    name,
-                                    _supervisor_context=child.supervisor_context
-                                )
-                            await child_tg.start(start_with_context)
+                # Query status
+                case (msg_type, cid, reply_to) if msg_type == GET_CHILD_STATUS:
+                    ch = children.get(cid)
+                    if ch:
+                        alive = _safe_is_alive(ch.pid)
+                        status = {
+                            "pid": ch.pid,
+                            "alive": alive,
+                            "restart_count": ch.restart_count,
+                        }
                     else:
-                        # Fallback to normal execution - always use tg.start()
-                        async with anyio.create_task_group() as child_tg:
-                            await child_tg.start(child.spec.task, *child.spec.args)
-                else:
-                    # Always use tg.start() for proper structured concurrency
-                    async with anyio.create_task_group() as child_tg:
-                        await child_tg.start(child.spec.task, *child.spec.args)
-            
-            # Task completed - this is unusual for persistent services
-            logger.warning(f"Child {child_id} completed unexpectedly (persistent services should not exit)")
+                        status = None
+                    await process.send(reply_to, status)
 
-        except anyio.get_cancelled_exc_class():
-            logger.info(f"Child {child_id} cancelled by supervisor")
-            return  # Exit immediately on cancellation - don't attempt restart
+                # List children
+                case (msg_type, reply_to) if msg_type == LIST_CHILDREN:
+                    await process.send(reply_to, list(children.keys()))
 
-        except ShutdownExit:
-            # ShutdownExit means never restart regardless of strategy
-            logger.info(f"Child {child_id} requested shutdown")
-            return
+                # Shutdown
+                case msg_type if msg_type == SHUTDOWN:
+                    shutting_down = True
+                    break
 
-        except NormalExit as e:
-            # NormalExit respects restart strategy
-            logger.info(f"Child {child_id} exited normally")
-            exception = e
+                # Ignore unknown
+                case _:
+                    pass
 
-        except Exception as e:
-            failed = True
-            exception = e
-            child.last_exception = e
-            logger.error(f"Child {child.spec.id} failed", exc_info=e)
+        except _IntensityExceeded:
+            shutting_down = True
+            break
+        except Exception:
+            # keep supervisor alive on unexpected error
+            pass
 
-        # CRITICAL: Check shutdown status before any restart logic
-        if state.shutting_down:
-            logger.info(f"Supervisor shutting down, not restarting {child_id}")
-            return
+    await _shutdown_children(children)
 
-        # Decide what to do next - CHECK LIMITS BEFORE ANY DELAYS
-        should_restart, limit_exceeded = state.should_restart_child(child_id, failed, exception)
+# --------------------------------------------------------------------------------------
+# Exit handler
+# --------------------------------------------------------------------------------------
 
-        if limit_exceeded:
-            # Restart intensity exceeded → crash the supervisor IMMEDIATELY
-            logger.error(f"Child {child.spec.id} terminated (restart limit exceeded)")
-            state.shutting_down = True
-            raise RuntimeError(
-                f"Supervisor shutting down: restart limit exceeded for child {child_id}"
-            ) from exception
+async def _handle_child_exit(
+    children: Dict[str, _ChildState],
+    dead_id: str,
+    reason: Any,
+    opts: options,
+    start_order: List[str],
+    intensity_times: deque,
+):
+    child = children[dead_id]
 
-        if not should_restart:
-            logger.info(f"Child {child_id} completed and will not be restarted")
-            return
+    # Static sup → no NORMAL exits. Anything not SHUTDOWN is abnormal.
+    if reason == SHUTDOWN or reason == SUPERVISOR_SHUTDOWN:
+        await _mark_down(child)
+        return
 
-        # Double-check shutdown status before sleeping/restarting
-        if state.shutting_down:
-            logger.info(f"Supervisor shutting down during restart attempt for {child_id}")
-            return
+    # Determine restart based on strategy
+    if opts.strategy == ONE_FOR_ONE:
+        if child.spec.name:
+            try:
+                await process.unregister(child.spec.name)
+            except Exception:
+                pass
+        await _restart_child(child, intensity_times, opts)
 
-        # Otherwise restart the child after a small delay
-        logger.info(f"Restarting child {child_id}")
-        child.restart_count += 1
-        child.health_check_failures = 0  # Reset health check failures on restart
-        
-        # Apply backoff delay AFTER confirming we should restart
-        delay = BACKOFF_DELAYS[min(child.backoff_level, len(BACKOFF_DELAYS) - 1)]
-        
-        # Sleep with periodic shutdown checks to avoid hanging during shutdown
-        sleep_interval = 0.1
-        total_slept = 0.0
-        while total_slept < delay and not state.shutting_down:
-            await anyio.sleep(min(sleep_interval, delay - total_slept))
-            total_slept += sleep_interval
-        
-        # Final check before loop continues
-        if state.shutting_down:
-            logger.info(f"Supervisor shutting down during restart delay for {child_id}")
-            return
-            
-        child.backoff_level = min(child.backoff_level + 1, len(BACKOFF_DELAYS) - 1)
+    elif opts.strategy == ONE_FOR_ALL:
+        # Kill everyone
+        for cid, other in children.items():
+            if _safe_is_alive(other.pid):
+                try:
+                    await process.exit(other.pid, SUPERVISOR_SHUTDOWN)
+                except ProcessNotFoundError:
+                    pass
+            await _mark_down(other)
+
+        # Restart in order
+        for cid in start_order:
+            await _restart_child(children[cid], intensity_times, opts)
+
+    elif opts.strategy == REST_FOR_ONE:
+        idx = start_order.index(dead_id)
+        victims = start_order[idx:]  # crashed child + later ones
+        # Kill victims
+        for cid in victims:
+            c = children[cid]
+            if _safe_is_alive(c.pid):
+                try:
+                    await process.exit(c.pid, SUPERVISOR_SHUTDOWN)
+                except ProcessNotFoundError:
+                    pass
+            await _mark_down(c)
+        # Restart victims
+        for cid in victims:
+            await _restart_child(children[cid], intensity_times, opts)
+
+    else:
+        # Unknown strategy → do nothing
+        pass

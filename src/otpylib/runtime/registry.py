@@ -7,11 +7,11 @@ between different runtime implementations (AnyIO, SPAM, etc.).
 
 import threading
 import logging
-from typing import Optional, List, Callable
+from typing import Any, Optional, List, Callable
 from weakref import WeakSet
 
-from .core import RuntimeBackend
-from .data import RuntimeError
+from otpylib.runtime.backends.base import RuntimeBackend
+from otpylib.distribution import DistributionProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +19,17 @@ logger = logging.getLogger(__name__)
 _current_backend: Optional[RuntimeBackend] = None
 _backend_lock = threading.RLock()
 
+_current_distribution: Optional[DistributionProtocol] = None
+_distribution_lock = threading.RLock()
+
 # Cache invalidation system
 _change_listeners: WeakSet[Callable[[], None]] = WeakSet()
+
+
+def get_distribution() -> Optional[DistributionProtocol]:
+    """Get the currently active distribution layer."""
+    with _distribution_lock:
+        return _current_distribution
 
 
 def get_runtime() -> Optional[RuntimeBackend]:
@@ -31,6 +40,19 @@ def get_runtime() -> Optional[RuntimeBackend]:
     """
     with _backend_lock:
         return _current_backend
+
+
+def set_distribution(distribution: DistributionProtocol) -> None:
+    """
+    Set the active distribution layer.
+    
+    :param distribution: Distribution implementation (e.g., AsyncIODistribution)
+    """
+    global _current_distribution
+    
+    with _backend_lock:
+        _current_distribution = distribution
+        logger.debug(f"Distribution layer set: {type(distribution).__name__}")
 
 
 def set_runtime(backend: RuntimeBackend) -> None:
@@ -54,10 +76,20 @@ def set_runtime(backend: RuntimeBackend) -> None:
         previous_backend = _current_backend
         _current_backend = backend
         
-        logger.info(f"Runtime backend changed: {type(previous_backend).__name__ if previous_backend else 'None'} -> {type(backend).__name__}")
+        logger.debug(f"Runtime backend changed: {type(previous_backend).__name__ if previous_backend else 'None'} -> {type(backend).__name__}")
         
         # Notify cache invalidation listeners
         _notify_change_listeners()
+
+
+def reset_distribution() -> None:
+    """Reset distribution to None."""
+    global _current_distribution
+    
+    with _backend_lock:
+        if _current_distribution:
+            logger.debug("Distribution layer reset")
+        _current_distribution = None
 
 
 def reset_runtime() -> Optional[RuntimeBackend]:
@@ -73,7 +105,7 @@ def reset_runtime() -> Optional[RuntimeBackend]:
         _current_backend = None
         
         if previous_backend:
-            logger.info(f"Runtime backend reset from {type(previous_backend).__name__}")
+            logger.debug(f"Runtime backend reset from {type(previous_backend).__name__}")
             
             # Notify cache invalidation listeners
             _notify_change_listeners()
@@ -204,7 +236,7 @@ def get_runtime_info() -> dict:
     with _backend_lock:
         if _current_backend:
             try:
-                stats = _current_backend.get_statistics()
+                stats = _current_backend.statistics()
                 return {
                     'backend_type': type(_current_backend).__name__,
                     'backend_active': True,

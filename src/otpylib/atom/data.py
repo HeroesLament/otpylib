@@ -6,7 +6,7 @@ from abc import ABC
 
 
 @runtime_checkable
-class Atom(Protocol):
+class AtomProtocol(Protocol):
     """Protocol for atom values - efficient symbolic constants.
     
     Atoms are immutable symbolic constants that can be compared by identity
@@ -41,7 +41,7 @@ class Atom(Protocol):
         ...
 
 
-class AtomImpl(ABC):
+class Atom(ABC):
     """Concrete implementation of an atom."""
     
     def __init__(self, atom_id: int, name: str):
@@ -58,7 +58,7 @@ class AtomImpl(ABC):
         return f"Atom({self._name!r})"
     
     def __eq__(self, other) -> bool:
-        if isinstance(other, AtomImpl):
+        if isinstance(other, Atom):
             return self._id == other._id
         return False
     

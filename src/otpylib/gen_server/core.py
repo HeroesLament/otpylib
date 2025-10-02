@@ -350,12 +350,13 @@ async def _handle_call(module: ModuleType, message: _CallMessage, state: Any) ->
             raise TypeError(f"Invalid handle_call return value: {result}")
 
 
-async def _handle_cast(module: ModuleType, message: Any, state: Any) -> Any:
+async def _handle_cast(module: ModuleType, message: _CastMessage, state: Any) -> Any:
     handler = getattr(module, "handle_cast", None)
     if handler is None:
         raise NotImplementedError("handle_cast not implemented")
 
-    result = await handler(message, state)
+    # Extract payload from the _CastMessage wrapper
+    result = await handler(message.payload, state)
 
     match result:
         case (NoReply(), new_state):

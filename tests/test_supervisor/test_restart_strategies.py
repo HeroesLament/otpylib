@@ -18,10 +18,13 @@ async def test_one_for_one_restart(test_data):
     results = {}
 
     async def flappy(label):
-        if test_data.exec_count == 0:
-            raise RuntimeError(f"{label} crash")
-        test_data.exec_count += 1
-        await asyncio.sleep(0.1)
+        """Factory that spawns a worker that crashes once then runs."""
+        async def worker():
+            if test_data.exec_count == 0:
+                raise RuntimeError(f"{label} crash")
+            test_data.exec_count += 1
+            await asyncio.sleep(0.1)
+        return await process.spawn(worker, mailbox=True)
 
     async def tester():
         specs = [child_spec(id="f", func=flappy, args=["f"], restart=PERMANENT)]
@@ -30,7 +33,6 @@ async def test_one_for_one_restart(test_data):
         results["sup_pid"] = sup_pid
 
         await asyncio.sleep(0.5)
-        status = await process.send(sup_pid, ("get_status", "f", process.self()))
         await process.exit(sup_pid, SHUTDOWN)
 
     await run_in_process(tester)
@@ -42,10 +44,13 @@ async def test_one_for_all_restart(test_data):
     results = {}
 
     async def flappy(label):
-        if test_data.exec_count == 0 and label == "f1":
-            raise RuntimeError("f1 crash")
-        test_data.exec_count += 1
-        await asyncio.sleep(0.1)
+        """Factory that spawns a worker - f1 crashes once then runs."""
+        async def worker():
+            if test_data.exec_count == 0 and label == "f1":
+                raise RuntimeError("f1 crash")
+            test_data.exec_count += 1
+            await asyncio.sleep(0.1)
+        return await process.spawn(worker, mailbox=True)
 
     async def tester():
         specs = [
@@ -68,10 +73,13 @@ async def test_rest_for_one_restart(test_data):
     results = {}
 
     async def flappy(label):
-        if test_data.exec_count == 0 and label == "mid":
-            raise RuntimeError("mid crash")
-        test_data.exec_count += 1
-        await asyncio.sleep(0.1)
+        """Factory that spawns a worker - mid crashes once then runs."""
+        async def worker():
+            if test_data.exec_count == 0 and label == "mid":
+                raise RuntimeError("mid crash")
+            test_data.exec_count += 1
+            await asyncio.sleep(0.1)
+        return await process.spawn(worker, mailbox=True)
 
     async def tester():
         specs = [
@@ -95,10 +103,13 @@ async def test_permanent_children_always_restart(test_data):
     results = {"restarts": 0}
 
     async def flappy():
-        results["restarts"] += 1
-        if results["restarts"] < 2:
-            raise RuntimeError("first crash")
-        await asyncio.sleep(0.1)
+        """Factory that spawns a worker that crashes once."""
+        async def worker():
+            results["restarts"] += 1
+            if results["restarts"] < 2:
+                raise RuntimeError("first crash")
+            await asyncio.sleep(0.1)
+        return await process.spawn(worker, mailbox=True)
 
     async def tester():
         specs = [child_spec(id="p", func=flappy, restart=PERMANENT)]
@@ -118,10 +129,13 @@ async def test_mixed_crash_patterns(test_data):
     results = {"events": []}
 
     async def worker(label, crash=False):
-        results["events"].append(f"{label}_start")
-        if crash:
-            raise RuntimeError(f"{label} crash")
-        await asyncio.sleep(0.1)
+        """Factory that spawns a worker that may crash."""
+        async def worker_impl():
+            results["events"].append(f"{label}_start")
+            if crash:
+                raise RuntimeError(f"{label} crash")
+            await asyncio.sleep(0.1)
+        return await process.spawn(worker_impl, mailbox=True)
 
     async def tester():
         specs = [

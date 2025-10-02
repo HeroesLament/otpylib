@@ -99,14 +99,24 @@ async def _shutdown_children(children: Dict[str, _ChildState]):
 
 
 async def _start_child(child: _ChildState):
-    pid, monitor_ref = await process.spawn_monitor(
-        child.spec.func,
-        args=child.spec.args,
-        kwargs=child.spec.kwargs,
-        name=child.spec.name,
-        mailbox=True,
-    )
-    child.pid = pid
+    """
+    Start a child and monitor it. 
+    
+    Calls the child function which should return a PID of the spawned process.
+    The supervisor then monitors that returned PID.
+    """
+    # Call the child function - it should return a PID
+    result_pid = await child.spec.func(*child.spec.args, **child.spec.kwargs)
+    
+    if not isinstance(result_pid, str):
+        raise RuntimeError(
+            f"Child function {child.spec.func.__name__} must return a PID string, "
+            f"got {type(result_pid).__name__}"
+        )
+    
+    # Monitor the returned PID
+    monitor_ref = await process.monitor(result_pid)
+    child.pid = result_pid
     child.monitor_ref = monitor_ref
 
 

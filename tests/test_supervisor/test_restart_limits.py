@@ -16,7 +16,10 @@ async def test_restart_intensity_limit(test_data):
     results = {}
 
     async def flappy():
-        raise RuntimeError("boom")
+        """Factory that spawns a crashing worker."""
+        async def worker():
+            raise RuntimeError("boom")
+        return await process.spawn(worker, mailbox=True)
 
     async def tester():
         specs = [
@@ -39,7 +42,10 @@ async def test_restart_window_sliding(test_data):
     results = {}
 
     async def flappy():
-        raise RuntimeError("boom")
+        """Factory that spawns a crashing worker."""
+        async def worker():
+            raise RuntimeError("boom")
+        return await process.spawn(worker, mailbox=True)
 
     async def tester():
         specs = [child_spec(id="flappy", func=flappy, restart=PERMANENT)]
@@ -60,7 +66,10 @@ async def test_restart_count_per_child(test_data):
     results = {}
 
     async def flappy(label):
-        raise RuntimeError(f"{label} crash")
+        """Factory that spawns a crashing worker."""
+        async def worker():
+            raise RuntimeError(f"{label} crash")
+        return await process.spawn(worker, mailbox=True)
 
     async def tester():
         specs = [
@@ -84,7 +93,10 @@ async def test_restart_limit_with_one_for_all(test_data):
     results = {}
 
     async def flappy():
-        raise RuntimeError("boom")
+        """Factory that spawns a crashing worker."""
+        async def worker():
+            raise RuntimeError("boom")
+        return await process.spawn(worker, mailbox=True)
 
     async def tester():
         specs = [
@@ -107,7 +119,10 @@ async def test_no_restart_limit_for_normal_exit(test_data):
     results = {}
 
     async def normal_exit():
-        return
+        """Factory that spawns a worker that exits normally."""
+        async def worker():
+            return
+        return await process.spawn(worker, mailbox=True)
 
     async def tester():
         specs = [
@@ -131,7 +146,10 @@ async def test_restart_limit_reset_after_window(test_data):
     results = {}
 
     async def flappy():
-        raise RuntimeError("boom")
+        """Factory that spawns a crashing worker."""
+        async def worker():
+            raise RuntimeError("boom")
+        return await process.spawn(worker, mailbox=True)
 
     async def tester():
         specs = [child_spec(id="f", func=flappy, restart=PERMANENT)]
@@ -154,7 +172,10 @@ async def test_multiple_children_intensity(test_data):
     results = {}
 
     async def flappy(label):
-        raise RuntimeError(f"{label} crash")
+        """Factory that spawns a crashing worker."""
+        async def worker():
+            raise RuntimeError(f"{label} crash")
+        return await process.spawn(worker, mailbox=True)
 
     async def tester():
         specs = [

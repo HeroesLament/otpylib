@@ -71,17 +71,37 @@ async def start(
     init_arg: Optional[Any] = None,
     name: Optional[str] = None,
 ) -> str:
+    """
+    Start a GenServer process (unlinked).
+    
+    BEAM semantics: Spawns a new process, waits for init to complete, returns PID.
+    """
     if name is None:
         name = module.__name__
-
+    
+    caller_pid = process.self()
+    if not caller_pid:
+        raise RuntimeError("gen_server.start() must be called from within a process")
+    
+    # Spawn the GenServer loop
     pid = await process.spawn(
         _gen_server_loop,
-        args=[module, init_arg],
+        args=[module, init_arg, caller_pid],
         name=name,
         mailbox=True,
     )
-    logger.debug(f"[gen_server.start] module={module}, name={name}, pid={pid}")
-    return pid
+    
+    # Wait for init handshake
+    msg = await process.receive(timeout=5.0)
+    
+    match msg:
+        case ("gen_server_init_ok", init_pid) if init_pid == pid:
+            logger.debug(f"[gen_server.start] module={module}, name={name}, pid={pid}")
+            return pid
+        case ("gen_server_init_error", init_pid, reason) if init_pid == pid:
+            raise RuntimeError(f"GenServer init failed: {reason}")
+        case _:
+            raise RuntimeError(f"Unexpected init reply: {msg}")
 
 
 async def start_link(
@@ -89,19 +109,37 @@ async def start_link(
     init_arg: Optional[Any] = None,
     name: Optional[str] = None,
 ) -> str:
-    """BEAM-style GenServer.start_link/3 equivalent."""
+    """
+    Start a GenServer process linked to the caller.
+    
+    BEAM semantics: Spawns a new linked process, waits for init to complete, returns PID.
+    """
     if name is None:
         name = module.__name__
-
+    
+    caller_pid = process.self()
+    if not caller_pid:
+        raise RuntimeError("gen_server.start_link() must be called from within a process")
+    
+    # Spawn and link the GenServer loop
     pid = await process.spawn_link(
         _gen_server_loop,
-        args=[module, init_arg],
+        args=[module, init_arg, caller_pid],
         name=name,
         mailbox=True,
     )
-    logger.debug(f"[gen_server.start_link] module={module}, name={name}, pid={pid}")
-    return pid
-
+    
+    # Wait for init handshake
+    msg = await process.receive(timeout=5.0)
+    
+    match msg:
+        case ("gen_server_init_ok", init_pid) if init_pid == pid:
+            logger.debug(f"[gen_server.start_link] module={module}, name={name}, pid={pid}")
+            return pid
+        case ("gen_server_init_error", init_pid, reason) if init_pid == pid:
+            raise RuntimeError(f"GenServer init failed: {reason}")
+        case _:
+            raise RuntimeError(f"Unexpected init reply: {msg}")
 
 async def call(
     target: Union[str, str],
@@ -218,14 +256,27 @@ async def _call_from_outside_process(
     except asyncio.TimeoutError:
         raise TimeoutError("GenServer call timed out")
 
-
-async def _gen_server_loop(module, init_arg):
+async def _gen_server_loop(module, init_arg, caller_pid=None):
     """Main GenServer loop, owns its state privately."""
     init_fn = getattr(module, "init", None)
+    state = None
+    
     if init_fn is not None:
-        state = await init_fn(init_arg)
+        try:
+            state = await init_fn(init_arg)
+            
+            # Send init success to caller
+            if caller_pid:
+                await process.send(caller_pid, ("gen_server_init_ok", process.self()))
+        except Exception as e:
+            # Send init failure to caller
+            if caller_pid:
+                await process.send(caller_pid, ("gen_server_init_error", process.self(), e))
+            raise
     else:
-        state = None
+        # No init function - still send success
+        if caller_pid:
+            await process.send(caller_pid, ("gen_server_init_ok", process.self()))
 
     try:
         while True:
@@ -239,7 +290,6 @@ async def _gen_server_loop(module, init_arg):
                 state = await _handle_info(module, message, state)
 
     except GenServerExited as e:
-        # 🔑 Proper BEAM semantics: stop/crash reasons propagate literally
         try:
             await _terminate(module, e.reason, state)
         except Exception:
@@ -247,7 +297,6 @@ async def _gen_server_loop(module, init_arg):
         raise
 
     except Exception as e:
-        # 🔑 Unexpected Python exception → normalize to crash
         try:
             await _terminate(module, CRASH, state)
         except Exception:

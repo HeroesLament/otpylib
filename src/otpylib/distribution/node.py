@@ -59,13 +59,10 @@ class Node:
         
         # Register with EPMD
         self.creation = await EPMD.register(self.short_name, self.port)
-        
-        print(f"Node '{self.name}' listening on port {self.port} (creation={self.creation})")
     
     async def _handle_incoming(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle incoming connection (server-side handshake)"""
         # TODO: Implement server-side handshake
-        print("Incoming connection - not yet fully implemented")
         writer.close()
     
     async def connect(self, remote_node: str):
@@ -86,7 +83,6 @@ class Node:
         await conn.connect(remote_host, node_info.port)
         
         self.connections[remote_node] = conn
-        print(f"Connected to '{remote_node}'")
     
     async def send(self, remote_node: str, to_name: str, message: Any):
         """Send message to registered process on remote node"""

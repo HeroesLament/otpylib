@@ -215,7 +215,6 @@ class Connection:
                         await self.message_handler(packet[offset:])
             
             except Exception as e:
-                print(f"Error in receive loop: {e}")
                 break
         
         self.connected = False

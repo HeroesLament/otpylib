@@ -95,7 +95,6 @@ class EPMD:
             return creation
         
         except Exception as e:
-            print(f"Warning: Could not register with EPMD: {e}")
             return 1
     
     @staticmethod

@@ -151,11 +151,11 @@ async def call(
     call_id = f"call_{_CALL_COUNTER}_{uuid.uuid4().hex[:8]}"
 
     caller_pid = process.self()
+    
     if caller_pid:
         return await _call_from_process(target, payload, timeout, call_id, caller_pid)
     else:
         return await _call_from_outside_process(target, payload, timeout, call_id)
-
 
 async def cast(target: Union[str, str], payload: Any) -> None:
     message = _CastMessage(payload=payload)
@@ -181,9 +181,21 @@ async def _call_from_process(
     call_id: str,
     caller_pid: str,
 ) -> Any:
-    ref = await process.monitor(target)
+    
+    # Always try to resolve the name to PID
+    target_pid = process.whereis(target)
+    
+    # If whereis returns None or returns the target itself (name not found), fail
+    if not target_pid or target_pid == target:
+        raise ValueError(f"GenServer '{target}' not found in registry")
+    
+    # Monitor the PID, not the name
+    ref = await process.monitor(target_pid)
+    
     try:
         message = _CallMessage(reply_to=caller_pid, payload=payload, call_id=call_id)
+        
+        # Send to the original target (could be name or PID)
         await process.send(target, message)
         logger.debug(f"[gen_server._call_from_process] sent call_id={call_id} to {target}")
 
@@ -206,9 +218,9 @@ async def _call_from_process(
                 logger.debug(f"[gen_server._call_from_process] got reply for call_id={call_id}: {result}")
                 if isinstance(result, Exception):
                     if isinstance(result, GenServerExited):
-                        raise result  # preserve stop/crash/etc.
+                        raise result
                     else:
-                        raise result  # real Python exception
+                        raise result
                 return result
 
             if (
@@ -216,7 +228,7 @@ async def _call_from_process(
                 and len(reply) == 4
                 and reply[0] == "DOWN"
                 and reply[1] == ref
-                and reply[2] == target
+                and reply[2] == target_pid
             ):
                 reason = reply[3]
                 logger.debug(f"[gen_server._call_from_process] target {target} died mid-call, reason={reason}")
@@ -224,7 +236,6 @@ async def _call_from_process(
 
     finally:
         await process.demonitor(ref, flush=True)
-
 
 async def _call_from_outside_process(
     target: str,
@@ -280,14 +291,27 @@ async def _gen_server_loop(module, init_arg, caller_pid=None):
 
     try:
         while True:
-            message = await process.receive()
+            print(f"[_gen_server_loop] Waiting for message, pid={process.self()}")
+            try:
+                message = await process.receive()
+                print(f"[_gen_server_loop] Received message type: {type(message).__name__}")
+                print(f"[_gen_server_loop] Message: {message}")
+            except Exception as e:
+                print(f"[_gen_server_loop] ERROR in receive: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
 
-            if isinstance(message, _CallMessage):
-                state = await _handle_call(module, message, state)
-            elif isinstance(message, _CastMessage):
-                state = await _handle_cast(module, message, state)
-            else:
-                state = await _handle_info(module, message, state)
+            match message:
+                case _CallMessage():
+                    print(f"[_gen_server_loop] Handling call message")
+                    state = await _handle_call(module, message, state)
+                case _CastMessage():
+                    print(f"[_gen_server_loop] Handling cast message")
+                    state = await _handle_cast(module, message, state)
+                case _:
+                    print(f"[_gen_server_loop] Handling info message")
+                    state = await _handle_info(module, message, state)
 
     except GenServerExited as e:
         try:
@@ -303,7 +327,6 @@ async def _gen_server_loop(module, init_arg, caller_pid=None):
             logger.error("[gen_server.loop] terminate callback raised", exc_info=True)
         logger.error("[gen_server.loop] crashed with %s", e, exc_info=True)
         raise GenServerExited(CRASH)
-
 
 # ============================================================================
 # Message handlers

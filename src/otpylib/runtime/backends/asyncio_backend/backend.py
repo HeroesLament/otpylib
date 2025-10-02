@@ -318,7 +318,11 @@ class AsyncIOBackend(RuntimeBackend):
 
     async def demonitor(self, ref: str, flush: bool = False) -> None:
         """Remove a monitor reference. If flush=True, drop any pending DOWN."""
-        proc = self._processes.get(self.self())
+        self_pid = self.self()
+        if not self_pid:
+            raise NotInProcessError("demonitor() must be called from within a process")
+
+        proc = self._processes.get(self_pid)
         if not proc:
             raise NotInProcessError("demonitor() must be called from within a process")
 
@@ -331,12 +335,20 @@ class AsyncIOBackend(RuntimeBackend):
         if target_proc:
             target_proc.monitored_by.pop(ref, None)
 
-        if flush:
-            # Remove pending DOWN from mailbox
-            mbox = proc.mailbox
-            if mbox:
-                proc.mailbox = [m for m in mbox if not (isinstance(m, tuple) and m[:2] == (DOWN, ref))]
+        if flush and proc.mailbox:
+            # Access the internal message queue to filter out DOWN messages
+            # ProcessMailbox stores messages in an asyncio.Queue accessed via _queue
+            if hasattr(proc.mailbox, '_queue') and hasattr(proc.mailbox._queue, '_queue'):
+                # Get the underlying deque from asyncio.Queue
+                queue_items = list(proc.mailbox._queue._queue)
+                filtered = [m for m in queue_items if not (isinstance(m, tuple) and len(m) >= 2 and m[0] == DOWN and m[1] == ref)]
 
+                # Clear and repopulate the queue
+                proc.mailbox._queue._queue.clear()
+                for item in filtered:
+                    proc.mailbox._queue._queue.append(item)
+
+                logger.debug(f"[demonitor] flushed DOWN messages for ref={ref}")
 
     # =========================================================================
     # Message Passing
@@ -345,21 +357,22 @@ class AsyncIOBackend(RuntimeBackend):
     async def send(self, pid: Union[str, Process], message: Any) -> None:
         """Send a message to a process (by pid or registered name)."""
         target_pid = None
-
-        if isinstance(pid, str):
-            target_pid = self._name_registry.get(pid, pid)
-        elif isinstance(pid, Process):
+    
+        if isinstance(pid, Process):
             target_pid = pid.pid
-
+        else:
+            # Handle both strings and atoms as names
+            target_pid = self._name_registry.get(pid, pid)
+    
         process = self._processes.get(target_pid)
         if not process:
             logger.debug(f"[send] Dropping to {pid} resolved={target_pid}: not alive")
             return
-
+    
         if not process.mailbox:
             logger.debug(f"[send] Dropping to {target_pid}: no mailbox")
             return
-
+    
         await process.mailbox.send(message)
         self._stats["messages_sent"] += 1
         logger.debug(f"[send] Delivered to {target_pid}: {message}")

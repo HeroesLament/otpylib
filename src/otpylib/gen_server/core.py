@@ -291,26 +291,19 @@ async def _gen_server_loop(module, init_arg, caller_pid=None):
 
     try:
         while True:
-            print(f"[_gen_server_loop] Waiting for message, pid={process.self()}")
             try:
                 message = await process.receive()
-                print(f"[_gen_server_loop] Received message type: {type(message).__name__}")
-                print(f"[_gen_server_loop] Message: {message}")
             except Exception as e:
-                print(f"[_gen_server_loop] ERROR in receive: {e}")
                 import traceback
                 traceback.print_exc()
                 raise
 
             match message:
                 case _CallMessage():
-                    print(f"[_gen_server_loop] Handling call message")
                     state = await _handle_call(module, message, state)
                 case _CastMessage():
-                    print(f"[_gen_server_loop] Handling cast message")
                     state = await _handle_cast(module, message, state)
                 case _:
-                    print(f"[_gen_server_loop] Handling info message")
                     state = await _handle_info(module, message, state)
 
     except GenServerExited as e:

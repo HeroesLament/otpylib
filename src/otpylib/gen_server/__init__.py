@@ -10,11 +10,6 @@ from otpylib.gen_server.core import (
     cast,
     reply,
     
-    # Response types
-    Reply,
-    NoReply,
-    Stop,
-    
     # Exceptions
     GenServerExited,
 )
@@ -51,6 +46,13 @@ from otpylib.gen_server.atoms import (
     CALL,
     CAST,
     INFO,
+)
+
+from otpylib.gen_server.data import (
+    Reply,
+    NoReply,
+    Stop,
+    CallbackNS,
 )
 
 __all__ = [
@@ -100,4 +102,7 @@ __all__ = [
     'CALL',
     'CAST',
     'INFO',
+
+    # Data helpers
+    'CallbackNS',
 ]

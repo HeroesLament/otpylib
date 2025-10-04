@@ -1,23 +1,29 @@
 """
 Generic Server using Process API
 
-Strict BEAM-aligned: no global state registry.  
+Strict BEAM-aligned: no global state registry.
 Each GenServer owns its own state; other processes cannot reach in.
 """
 
-from typing import Callable, TypeVar, Union, Optional, Any, Dict
+from typing import TypeVar, Union, Optional, Any, Dict
 from types import ModuleType
-import logging
 import time
 import uuid
 import asyncio
 from dataclasses import dataclass
 
-from otpylib import process
+from otpylib import atom, process
 from otpylib.gen_server.atoms import (
     STOP_ACTION,
     CRASH,
+    DOWN,
+    EXIT,
+    TIMEOUT,
 )
+from otpylib.gen_server.data import Reply, NoReply, Stop
+
+# Logger target atom
+LOGGER = atom.ensure("logger")
 
 State = TypeVar("State")
 
@@ -25,7 +31,27 @@ State = TypeVar("State")
 _PENDING_CALLS: Dict[str, asyncio.Future] = {}
 _CALL_COUNTER = 0
 
-logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Exceptions
+# ============================================================================
+
+class GenServerContractError(Exception):
+    """Base class for all GenServer contract violations."""
+
+
+class GenServerBadArity(GenServerContractError):
+    def __init__(self, func_name: str, expected: int, got: int):
+        super().__init__(f"{func_name} expected {expected} args, got {got}")
+        self.func_name = func_name
+        self.expected = expected
+        self.got = got
+
+
+class GenServerBadReturn(GenServerContractError):
+    def __init__(self, value: Any):
+        super().__init__(f"Invalid return from GenServer handler: {value!r}")
+        self.value = value
 
 
 class GenServerExited(Exception):
@@ -35,20 +61,9 @@ class GenServerExited(Exception):
         self.reason = reason
 
 
-@dataclass
-class Reply:
-    payload: Any
-
-
-@dataclass
-class NoReply:
-    pass
-
-
-@dataclass
-class Stop:
-    reason: Any = STOP_ACTION
-
+# ============================================================================
+# Internal Messages
+# ============================================================================
 
 @dataclass
 class _CallMessage:
@@ -66,138 +81,150 @@ class _CastMessage:
 # Public API
 # ============================================================================
 
-async def start(
-    module: ModuleType,
-    init_arg: Optional[Any] = None,
-    name: Optional[str] = None,
-) -> str:
-    """
-    Start a GenServer process (unlinked).
-    
-    BEAM semantics: Spawns a new process, waits for init to complete, returns PID.
-    """
-    if name is None:
-        name = module.__name__
-    
+async def start(module: ModuleType, init_arg: Optional[Any] = None, name: Optional[str] = None) -> str:
+    """Start a GenServer process (unlinked)."""
     caller_pid = process.self()
     if not caller_pid:
         raise RuntimeError("gen_server.start() must be called from within a process")
-    
-    # Spawn the GenServer loop
+
     pid = await process.spawn(
         _gen_server_loop,
         args=[module, init_arg, caller_pid],
         name=name,
         mailbox=True,
     )
+
+    # Buffer messages that aren't our init response
+    buffered_messages = []
     
-    # Wait for init handshake
-    msg = await process.receive(timeout=5.0)
-    
-    match msg:
-        case ("gen_server_init_ok", init_pid) if init_pid == pid:
-            logger.debug(f"[gen_server.start] module={module}, name={name}, pid={pid}")
-            return pid
-        case ("gen_server_init_error", init_pid, reason) if init_pid == pid:
-            raise RuntimeError(f"GenServer init failed: {reason}")
-        case _:
-            raise RuntimeError(f"Unexpected init reply: {msg}")
+    try:
+        while True:
+            msg = await process.receive(timeout=5.0)
+            match msg:
+                case ("gen_server_init_ok", init_pid) if init_pid == pid:
+                    # Re-inject buffered messages back into our mailbox
+                    for buffered_msg in buffered_messages:
+                        await process.send(caller_pid, buffered_msg)
+                    
+                    modname = getattr(module, "name", getattr(module, "__name__", str(module)))
+                    await process.send(LOGGER, ("log", "DEBUG",
+                        f"[gen_server.start] module={modname}, name={name}, pid={pid} init ok",
+                        {"module": modname, "pid": pid, "name": name}))
+                    return pid
+                case ("gen_server_init_error", init_pid, reason) if init_pid == pid:
+                    # Re-inject buffered messages even on error
+                    for buffered_msg in buffered_messages:
+                        await process.send(caller_pid, buffered_msg)
+                    raise RuntimeError(f"[gen_server.start] module={module} pid={pid} init failed: {reason}")
+                case ("gen_server_init_ok", init_pid) | ("gen_server_init_error", init_pid, _):
+                    # Init message for a different pid - this is unexpected, preserve original error
+                    for buffered_msg in buffered_messages:
+                        await process.send(caller_pid, buffered_msg)
+                    raise RuntimeError(f"[gen_server.start] module={module} pid={pid} unexpected init reply: {msg}")
+                case _:
+                    # Not an init message - buffer it and keep waiting
+                    buffered_messages.append(msg)
+    except TimeoutError:
+        # Re-inject buffered messages on timeout too
+        for buffered_msg in buffered_messages:
+            await process.send(caller_pid, buffered_msg)
+        raise TimeoutError(f"[gen_server.start] module={module} pid={pid} init timeout after 5.0s")
 
 
-async def start_link(
-    module: ModuleType,
-    init_arg: Optional[Any] = None,
-    name: Optional[str] = None,
-) -> str:
-    """
-    Start a GenServer process linked to the caller.
-    
-    BEAM semantics: Spawns a new linked process, waits for init to complete, returns PID.
-    """
-    if name is None:
-        name = module.__name__
-    
+async def start_link(module: ModuleType, init_arg: Optional[Any] = None, name: Optional[str] = None) -> str:
+    """Start a GenServer process linked to the caller."""
     caller_pid = process.self()
     if not caller_pid:
         raise RuntimeError("gen_server.start_link() must be called from within a process")
-    
-    # Spawn and link the GenServer loop
+
     pid = await process.spawn_link(
         _gen_server_loop,
         args=[module, init_arg, caller_pid],
         name=name,
         mailbox=True,
     )
-    
-    # Wait for init handshake
-    msg = await process.receive(timeout=5.0)
-    
-    match msg:
-        case ("gen_server_init_ok", init_pid) if init_pid == pid:
-            logger.debug(f"[gen_server.start_link] module={module}, name={name}, pid={pid}")
-            return pid
-        case ("gen_server_init_error", init_pid, reason) if init_pid == pid:
-            raise RuntimeError(f"GenServer init failed: {reason}")
-        case _:
-            raise RuntimeError(f"Unexpected init reply: {msg}")
 
-async def call(
-    target: Union[str, str],
-    payload: Any,
-    timeout: Optional[float] = None,
-) -> Any:
+    # Buffer messages that aren't our init response
+    buffered_messages = []
+    
+    try:
+        while True:
+            msg = await process.receive(timeout=5.0)
+            match msg:
+                case ("gen_server_init_ok", init_pid) if init_pid == pid:
+                    # Re-inject buffered messages back into our mailbox
+                    for buffered_msg in buffered_messages:
+                        await process.send(caller_pid, buffered_msg)
+                    
+                    modname = getattr(module, "name", getattr(module, "__name__", str(module)))
+                    await process.send(LOGGER, ("log", "DEBUG",
+                        f"[gen_server.start_link] module={modname}, name={name}, pid={pid} init ok",
+                        {"module": modname, "pid": pid, "name": name}))
+                    return pid
+                case ("gen_server_init_error", init_pid, reason) if init_pid == pid:
+                    # Re-inject buffered messages even on error
+                    for buffered_msg in buffered_messages:
+                        await process.send(caller_pid, buffered_msg)
+                    raise RuntimeError(f"[gen_server.start_link] module={module} pid={pid} init failed: {reason}")
+                case ("gen_server_init_ok", init_pid) | ("gen_server_init_error", init_pid, _):
+                    # Init message for a different pid - this is unexpected, preserve original error
+                    for buffered_msg in buffered_messages:
+                        await process.send(caller_pid, buffered_msg)
+                    raise RuntimeError(f"[gen_server.start_link] module={module} pid={pid} unexpected init reply: {msg}")
+                case _:
+                    # Not an init message - buffer it and keep waiting
+                    buffered_messages.append(msg)
+    except TimeoutError:
+        # Re-inject buffered messages on timeout too
+        for buffered_msg in buffered_messages:
+            await process.send(caller_pid, buffered_msg)
+        raise TimeoutError(f"[gen_server.start_link] module={module} pid={pid} init timeout after 5.0s")
+
+
+async def call(target: Union[str, str], payload: Any, timeout: Optional[float] = None) -> Any:
+    """Synchronous call to a GenServer (awaits reply)."""
     global _CALL_COUNTER
     _CALL_COUNTER += 1
     call_id = f"call_{_CALL_COUNTER}_{uuid.uuid4().hex[:8]}"
 
     caller_pid = process.self()
-    
     if caller_pid:
         return await _call_from_process(target, payload, timeout, call_id, caller_pid)
     else:
         return await _call_from_outside_process(target, payload, timeout, call_id)
 
+
 async def cast(target: Union[str, str], payload: Any) -> None:
+    """Asynchronous cast to a GenServer (no reply)."""
     message = _CastMessage(payload=payload)
-    logger.debug(f"[gen_server.cast] target={target}, payload={payload}")
+    await process.send(LOGGER, ("log", "DEBUG",
+        f"[gen_server.cast] target={target}, payload={payload}",
+        {"target": target, "payload": payload}))
     await process.send(target, message)
 
 
-async def reply(caller: Union[str, Callable], response: Any) -> None:
-    if callable(caller):
-        await caller(response)
-    else:
-        await process.send(caller, response)
+async def reply(from_: tuple[str, str], response: Any) -> None:
+    """Reply to a GenServer call from inside handle_call."""
+    reply_to, call_id = from_
+    await process.send(reply_to, (call_id, response))
 
 
 # ============================================================================
 # Internal helpers
 # ============================================================================
 
-async def _call_from_process(
-    target: str,
-    payload: Any,
-    timeout: Optional[float],
-    call_id: str,
-    caller_pid: str,
-) -> Any:
-    
-    # Always try to resolve the name to PID
+async def _call_from_process(target: str, payload: Any, timeout: Optional[float], call_id: str, caller_pid: str) -> Any:
     target_pid = process.whereis(target)
-    
-    # If whereis returns None or returns the target itself (name not found), fail
     if not target_pid or target_pid == target:
         raise ValueError(f"GenServer '{target}' not found in registry")
-    
-    # Monitor the PID, not the name
+
     ref = await process.monitor(target_pid)
-    
     try:
         message = _CallMessage(reply_to=caller_pid, payload=payload, call_id=call_id)
-        
-        # Send to the original target (could be name or PID)
         await process.send(target, message)
-        logger.debug(f"[gen_server._call_from_process] sent call_id={call_id} to {target}")
+        await process.send(LOGGER, ("log", "DEBUG",
+            f"[gen_server._call_from_process] call_id={call_id} target={target} from={caller_pid}",
+            {"call_id": call_id, "target": target, "from": caller_pid}))
 
         start_time = time.time()
         while True:
@@ -206,43 +233,31 @@ async def _call_from_process(
                 elapsed = time.time() - start_time
                 remaining_timeout = timeout - elapsed
                 if remaining_timeout <= 0:
-                    raise TimeoutError("GenServer call timed out")
+                    raise TimeoutError(f"gen_server.call {call_id} timed out")
 
-            try:
-                reply = await process.receive(timeout=remaining_timeout)
-            except TimeoutError:
-                raise TimeoutError("GenServer call timed out")
+            reply = await process.receive(timeout=remaining_timeout)
 
             if isinstance(reply, tuple) and len(reply) == 2 and reply[0] == call_id:
                 _, result = reply
-                logger.debug(f"[gen_server._call_from_process] got reply for call_id={call_id}: {result}")
                 if isinstance(result, Exception):
-                    if isinstance(result, GenServerExited):
-                        raise result
-                    else:
-                        raise result
+                    raise result
                 return result
 
             if (
                 isinstance(reply, tuple)
                 and len(reply) == 4
-                and reply[0] == "DOWN"
+                and reply[0] == DOWN
                 and reply[1] == ref
                 and reply[2] == target_pid
             ):
                 reason = reply[3]
-                logger.debug(f"[gen_server._call_from_process] target {target} died mid-call, reason={reason}")
                 raise GenServerExited(reason)
 
     finally:
         await process.demonitor(ref, flush=True)
 
-async def _call_from_outside_process(
-    target: str,
-    payload: Any,
-    timeout: Optional[float],
-    call_id: str,
-) -> Any:
+
+async def _call_from_outside_process(target: str, payload: Any, timeout: Optional[float], call_id: str) -> Any:
     future = asyncio.Future()
     _PENDING_CALLS[call_id] = future
 
@@ -265,107 +280,112 @@ async def _call_from_outside_process(
         else:
             return await future
     except asyncio.TimeoutError:
-        raise TimeoutError("GenServer call timed out")
+        raise TimeoutError(f"gen_server.call {call_id} timed out")
 
-async def _gen_server_loop(module, init_arg, caller_pid=None):
-    """Main GenServer loop, owns its state privately."""
-    init_fn = getattr(module, "init", None)
-    state = None
-    
-    if init_fn is not None:
-        try:
-            state = await init_fn(init_arg)
-            
-            # Send init success to caller
-            if caller_pid:
-                await process.send(caller_pid, ("gen_server_init_ok", process.self()))
-        except Exception as e:
-            # Send init failure to caller
-            if caller_pid:
-                await process.send(caller_pid, ("gen_server_init_error", process.self(), e))
-            raise
-    else:
-        # No init function - still send success
-        if caller_pid:
-            await process.send(caller_pid, ("gen_server_init_ok", process.self()))
 
+# ============================================================================
+# GenServer loop
+# ============================================================================
+
+async def _gen_server_loop(module: ModuleType, init_arg: Any, caller_pid: str) -> None:
+    pid = process.self()
+    modname = getattr(module, "name", getattr(module, "__name__", str(module)))
+
+    # --- Init handshake ---
     try:
-        while True:
-            try:
-                message = await process.receive()
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                raise
+        init_fn = getattr(module, "init", None)
+        if init_fn is None:
+            await process.send(caller_pid, ("gen_server_init_error", pid, "no init/1 defined"))
+            return
 
-            match message:
-                case _CallMessage():
-                    state = await _handle_call(module, message, state)
-                case _CastMessage():
-                    state = await _handle_cast(module, message, state)
-                case _:
-                    state = await _handle_info(module, message, state)
+        result = await init_fn(init_arg)
+        state = result  # allow simple `return state`
 
-    except GenServerExited as e:
-        try:
-            await _terminate(module, e.reason, state)
-        except Exception:
-            logger.error("[gen_server.loop] terminate callback raised", exc_info=True)
-        raise
+        await process.send(caller_pid, ("gen_server_init_ok", pid))
+        await process.send(LOGGER, ("log", "DEBUG",
+            f"[gen_server.init] module={modname}, pid={pid} initialized",
+            {"module": modname, "pid": pid}))
 
     except Exception as e:
-        try:
-            await _terminate(module, CRASH, state)
-        except Exception:
-            logger.error("[gen_server.loop] terminate callback raised", exc_info=True)
-        logger.error("[gen_server.loop] crashed with %s", e, exc_info=True)
-        raise GenServerExited(CRASH)
+        await process.send(caller_pid, ("gen_server_init_error", pid, repr(e)))
+        return
+
+    # --- Main loop ---
+    try:
+        while True:
+            msg = await process.receive()
+            try:
+                match msg:
+                    case _CallMessage() as call:
+                        state = await _handle_call(module, call, state)
+                    case _CastMessage() as cast_msg:
+                        state = await _handle_cast(module, cast_msg, state)
+                    case (action, reason) if action == STOP_ACTION:
+                        await process.send(LOGGER, ("log", "DEBUG",
+                            f"[gen_server.loop] module={modname}, pid={pid} stop requested: {reason}",
+                            {"module": modname, "pid": pid, "reason": reason}))
+                        raise GenServerExited(reason)
+                    case _:
+                        state = await _handle_info(module, msg, state)
+
+            except Exception as e:
+                await process.send(LOGGER, ("log", "ERROR",
+                    f"[gen_server.loop] module={modname}, pid={pid} crashed with {repr(e)}",
+                    {"module": modname, "pid": pid, "exception": repr(e)}))
+                raise
+
+    except GenServerExited as e:
+        await process.send(LOGGER, ("log", "INFO",
+            f"[gen_server.loop] module={modname}, pid={pid} stopped: {e}",
+            {"module": modname, "pid": pid, "reason": str(e)}))
+        raise
+    except Exception as e:
+        await process.send(LOGGER, ("log", "ERROR",
+            f"[gen_server.loop] module={modname}, pid={pid} terminated abnormally: {repr(e)}",
+            {"module": modname, "pid": pid, "exception": repr(e)}))
+        raise
+
 
 # ============================================================================
 # Message handlers
 # ============================================================================
 
-async def _handle_call(module: ModuleType, message: _CallMessage, state: Any) -> Any:
+async def _handle_call(module, message, state):
     handler = getattr(module, "handle_call", None)
     if handler is None:
         error = NotImplementedError("handle_call not implemented")
         await process.send(message.reply_to, (message.call_id, error))
         return state
 
-    async def reply_fn(payload):
-        await process.send(message.reply_to, (message.call_id, payload))
-
-    result = await handler(message.payload, reply_fn, state)
+    result = await handler(message.payload, (message.reply_to, message.call_id), state)
 
     match result:
-        case (Reply(payload), new_state):
+        case (Reply(payload=payload), new_state):
             await process.send(message.reply_to, (message.call_id, payload))
             return new_state
         case (NoReply(), new_state):
             return new_state
-        case (Stop(reason), new_state):
+        case (Stop(reason=reason), new_state):
             await process.send(message.reply_to, (message.call_id, GenServerExited(reason)))
             raise GenServerExited(reason)
         case _:
-            raise TypeError(f"Invalid handle_call return value: {result}")
+            raise GenServerBadReturn(result)
 
 
-async def _handle_cast(module: ModuleType, message: _CastMessage, state: Any) -> Any:
+async def _handle_cast(module, message: _CastMessage, state: Any) -> Any:
     handler = getattr(module, "handle_cast", None)
     if handler is None:
-        raise NotImplementedError("handle_cast not implemented")
+        return state
 
-    # Extract payload from the _CastMessage wrapper
     result = await handler(message.payload, state)
 
     match result:
         case (NoReply(), new_state):
             return new_state
-        case (Stop(reason), new_state):
-            reason_atom = reason or STOP_ACTION
-            raise GenServerExited(reason_atom)
+        case (Stop(reason=reason), new_state):
+            raise GenServerExited(reason or STOP_ACTION)
         case _:
-            raise TypeError(f"Invalid handle_cast return value: {result}")
+            raise GenServerBadReturn(result)
 
 
 async def _handle_info(module: ModuleType, message: Any, state: Any) -> Any:
@@ -378,11 +398,10 @@ async def _handle_info(module: ModuleType, message: Any, state: Any) -> Any:
     match result:
         case (NoReply(), new_state):
             return new_state
-        case (Stop(reason), new_state):
-            reason_atom = reason or STOP_ACTION
-            raise GenServerExited(reason_atom)
+        case (Stop(reason=reason), new_state):
+            raise GenServerExited(reason or STOP_ACTION)
         case _:
-            raise TypeError(f"Invalid handle_info return value: {result}")
+            raise GenServerBadReturn(result)
 
 
 # ============================================================================
@@ -391,11 +410,15 @@ async def _handle_info(module: ModuleType, message: Any, state: Any) -> Any:
 
 async def _terminate(module, reason, state):
     handler = getattr(module, "terminate", None)
-
+    modname = getattr(module, "name", getattr(module, "__name__", str(module)))
     if handler is not None:
         try:
             await handler(reason, state)
         except Exception as e:
-            logger.error(f"Error in terminate handler: {e}", exc_info=True)
+            await process.send(LOGGER, ("log", "ERROR",
+                f"[gen_server.terminate] module={modname}, pid={process.self()} error in terminate handler: {e}",
+                {"module": modname, "pid": process.self(), "exception": repr(e)}))
     elif reason is not None:
-        logger.error(f"GenServer terminated with reason={reason}", exc_info=True)
+        await process.send(LOGGER, ("log", "ERROR",
+            f"[gen_server.terminate] module={modname}, pid={process.self()} terminated with reason={reason}",
+            {"module": modname, "pid": process.self(), "reason": reason}))

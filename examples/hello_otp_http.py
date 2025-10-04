@@ -5,26 +5,18 @@ Example: OTP Hello World HTTP server (wrapper-child, stable)
 What this demonstrates:
 - Static supervisor: supervisor.start(children, options(...), name=...)
 - GenServer started via a *wrapper child* that stays alive
-  (prevents normal-return restarts and name clashes)
 - Ephemeral port bind (host, 0), with log of the chosen port
 """
 
 import asyncio
-import logging
 from typing import Tuple
 
 from otpylib import process, supervisor, gen_server
 from otpylib.runtime.backends.asyncio_backend.backend import AsyncIOBackend
 from otpylib.runtime.registry import set_runtime
-
-
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-logging.basicConfig(level=logging.DEBUG, format="%(levelname)s:%(name)s:%(message)s")
-logger = logging.getLogger(__name__)
-
-print("\n=== Example: OTP Hello World HTTP server ===")
+import otpylib_logger as logger
+from otpylib_logger import LOGGER_SUP
+from otpylib_logger.data import LoggerSpec, HandlerSpec, LogLevel
 
 
 # -----------------------------------------------------------------------------
@@ -34,7 +26,7 @@ async def connection_worker(reader: asyncio.StreamReader, writer: asyncio.Stream
     try:
         data = await reader.read(1024)
         first = data.decode(errors="ignore").splitlines()[0] if data else "-"
-        logger.info(f"[conn:{process.self()}] got: {first}")
+        await logger.info(f"[conn:{process.self()}] got: {first}")
 
         body = b"Hello World"
         resp = (
@@ -51,7 +43,7 @@ async def connection_worker(reader: asyncio.StreamReader, writer: asyncio.Stream
             await writer.wait_closed()
         except Exception:
             pass
-        logger.info("[conn] closed")
+        await logger.info("[conn] closed")
 
 
 # -----------------------------------------------------------------------------
@@ -63,21 +55,18 @@ class HttpListenerModule:
     @staticmethod
     async def init(init_arg: Tuple[str, int]):
         host, port = init_arg
-        logger.info(f"[HttpListener] requested bind on {host}:{port}")
+        print(f"[HttpListener] requested bind on {host}:{port}")
 
         async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-            # Spawn a lightweight otpylib process per connection
             await process.spawn(connection_worker, args=[reader, writer])
 
         server = await asyncio.start_server(handle_client, host, port)
-        # Discover the ephemeral port actually chosen (when port==0)
         sock = server.sockets[0].getsockname() if server.sockets else (host, port)
-        logger.info(f"[HttpListener] listening on {sock[0]}:{sock[1]}")
+        print(f"[HttpListener] listening on {sock[0]}:{sock[1]}")
         return {"server": server, "sock": sock}
 
     @staticmethod
     async def handle_info(message, state):
-        # No special info handling; keep state
         return gen_server.NoReply(), state
 
     @staticmethod
@@ -86,63 +75,93 @@ class HttpListenerModule:
         if server:
             server.close()
             await server.wait_closed()
-            logger.info("[HttpListener] server closed")
+            print("[HttpListener] server closed")
 
 
 # -----------------------------------------------------------------------------
-# Wrapper child process for the listener
-#   - Starts the GenServer via start_link (linked to this wrapper)
-#   - Keeps running (so the supervisor doesn't see a normal exit)
+# Wrapper child - returns a spawned process PID
 # -----------------------------------------------------------------------------
 async def http_listener_child():
-    server_name = "http_listener_server"  # distinct from wrapper name
-    # Bind to ephemeral port 0 to avoid conflicts
-    await gen_server.start_link(HttpListenerModule, ("127.0.0.1", 0), name=server_name)
-    logger.info(f"[http_listener_child] GenServer started (name={server_name})")
+    """Factory that spawns the HTTP listener wrapper process."""
+    async def listener_wrapper():
+        server_name = "http_listener_server"
+        await gen_server.start_link(HttpListenerModule, ("127.0.0.1", 0), name=server_name)
+        await logger.info(f"[listener_wrapper] GenServer started (name={server_name})")
 
-    # Keep this wrapper alive; supervisor now sees it as healthy
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        # Supervisor shutdown will cancel this; linked GenServer will be taken down too
-        logger.info("[http_listener_child] cancelled")
-        raise
+        # Keep wrapper alive
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await logger.info("[listener_wrapper] cancelled")
+            raise
+    
+    return await process.spawn(listener_wrapper, mailbox=True)
 
 
 # -----------------------------------------------------------------------------
-# HTTP supervisor bootstrap (child of http_app)
+# HTTP supervisor setup
 # -----------------------------------------------------------------------------
 async def start_http_sup():
+    """Start HTTP supervisor with logger and listener."""
+    logger_spec = LoggerSpec(
+        level=LogLevel.INFO,
+        handlers=[
+            HandlerSpec(
+                name="console",
+                handler_module="otpylib_logger.handlers.console",
+                config={"use_stderr": False, "colorize": True},
+                level=LogLevel.INFO,
+            ),
+        ]
+    )
+
     children = [
         supervisor.child_spec(
-            id="http_listener",
-            func=http_listener_child,           # wrapper that stays alive
-            args=[],
+            id=LOGGER_SUP,
+            func=logger.start_link,
+            args=[logger_spec],
             restart=supervisor.PERMANENT,
-            name="http_listener",               # wrapper's registered name (distinct from server_name)
+        ),
+        supervisor.child_spec(
+            id="http_listener",
+            func=http_listener_child,
+            restart=supervisor.PERMANENT,
         ),
     ]
+    
     opts = supervisor.options(strategy=supervisor.ONE_FOR_ONE)
-    sup_pid = await supervisor.start(children, opts, name="http_super")
-    logger.info(f"[http_sup] started as {sup_pid}")
+    
+    # supervisor.start() spawns the supervisor and returns after handshake
+    sup_pid = await supervisor.start(
+        child_specs=children,
+        opts=opts,
+        name="http_super"
+    )
+    
     return sup_pid
 
 
 # -----------------------------------------------------------------------------
-# Application process (roots the supervision tree)
+# Application process
 # -----------------------------------------------------------------------------
 async def http_app():
-    logger.info(f"[http_app] running in {process.self()}")
-    sup_pid = await process.spawn(start_http_sup)
-    logger.info(f"[http_app] supervisor started as {sup_pid}")
+    """Root application process."""
+    print(f"[http_app] starting in {process.self()}")
+    
+    # Start supervisor (returns immediately after handshake)
+    sup_pid = await start_http_sup()
+    print(f"[http_app] supervisor started as {sup_pid}")
+    
+    # Wait for logger to be ready
+    await asyncio.sleep(0.5)
+    await logger.info("[http_app] entering main loop")
 
-    # Keep the app alive (simple run loop)
     try:
         while True:
             await asyncio.sleep(1.0)
     except asyncio.CancelledError:
-        logger.info("[http_app] cancelled; exiting")
+        await logger.info("[http_app] cancelled; exiting")
         raise
 
 
@@ -150,23 +169,19 @@ async def http_app():
 # Entrypoint
 # -----------------------------------------------------------------------------
 async def main():
-    # Backend init & registration
     backend = AsyncIOBackend()
     await backend.initialize()
     set_runtime(backend)
 
-    # Spawn root app
-    app_pid = await process.spawn(http_app)
+    app_pid = await process.spawn(http_app, mailbox=True)
     print(f"[main] spawned http_app process {app_pid}")
 
-    # Run until Ctrl+C
     try:
         while True:
             await asyncio.sleep(1.0)
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("[main] shutting down")
+        print("\n[main] shutting down")
     finally:
-        # Best-effort nudge to the app (optional; app doesn't receive)
         try:
             if process.is_alive(app_pid):
                 await process.send(app_pid, supervisor.SHUTDOWN)

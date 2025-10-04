@@ -30,23 +30,23 @@ SHUTTING_DOWN = ensure("shutting_down")
 TERMINATED = ensure("terminated")
 
 # Dynamic Supervisor Message Atoms
-GET_CHILD_STATUS = ensure("get_child_status")
-LIST_CHILDREN = ensure("list_children")
-WHICH_CHILDREN = ensure("which_children")
-COUNT_CHILDREN = ensure("count_children")
-ADD_CHILD = ensure("add_child")
-TERMINATE_CHILD = ensure("terminate_child")
-RESTART_CHILD = ensure("restart_child")
+GET_CHILD_STATUS   = ensure("get_child_status")
+LIST_CHILDREN      = ensure("list_children")
+WHICH_CHILDREN     = ensure("which_children")
+COUNT_CHILDREN     = ensure("count_children")
+ADD_CHILD          = ensure("add_child")
+TERMINATE_CHILD    = ensure("terminate_child")
+RESTART_CHILD      = ensure("restart_child")
 
 # Process Message Atoms
-EXIT = ensure("EXIT")
-DOWN = ensure("DOWN")
+EXIT    = ensure("EXIT")
+DOWN    = ensure("DOWN")
 PROCESS = ensure("process")
 
 # Child Types
-WORKER = ensure("worker")
+WORKER     = ensure("worker")
 SUPERVISOR = ensure("supervisor")
 
-# Dynamic Supervisor Specific
+# Static/Dynamic flags
 DYNAMIC = ensure("dynamic")
-STATIC = ensure("static")
+STATIC  = ensure("static")

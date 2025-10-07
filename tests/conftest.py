@@ -3,9 +3,6 @@ import asyncio
 import sys
 from io import StringIO
 
-from otpylib import logging
-from loguru import logger
-
 
 # Mark all async tests to use anyio
 pytestmark = pytest.mark.asyncio
@@ -15,29 +12,3 @@ pytestmark = pytest.mark.asyncio
 @pytest.fixture
 def anyio_backend():
     return 'asyncio'
-
-
-@pytest.fixture
-def log_handler():
-    """
-    Capture log output for testing using loguru.
-    """
-    # Create a StringIO buffer to capture logs
-    log_buffer = StringIO()
-    
-    # Remove default handlers
-    logger.remove()
-    
-    # Add test handler that writes to buffer
-    handler_id = logger.add(
-        sink=log_buffer,
-        level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {extra[module]} | {message}",
-        colorize=False,  # No colors in test output
-    )
-    
-    yield log_buffer
-    
-    # Cleanup: remove test handler and reset to defaults
-    logger.remove(handler_id)
-    logging.configure_logging()  # Reset to default configuration

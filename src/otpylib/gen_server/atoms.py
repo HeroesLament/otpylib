@@ -9,7 +9,7 @@ These atoms are not user-facing messages — they are internal markers for
 logging, supervision, metrics, and error reasons.
 """
 
-from otpylib.atom import ensure
+from otpylib import atom
 
 # ============================================================================
 # Lifecycle State Atoms
@@ -18,13 +18,13 @@ from otpylib.atom import ensure
 # BEAM itself does not expose all of these explicitly, but they are useful
 # for tracing and introspection.
 
-INITIALIZING         = ensure("initializing")
-RUNNING              = ensure("running")
-WAITING_FOR_MESSAGE  = ensure("waiting_for_message")
-PROCESSING_MESSAGE   = ensure("processing_message")
-STOPPING             = ensure("stopping")
-CRASHED              = ensure("crashed")
-TERMINATED           = ensure("terminated")
+INITIALIZING         = atom.ensure("initializing")
+RUNNING              = atom.ensure("running")
+WAITING_FOR_MESSAGE  = atom.ensure("waiting_for_message")
+PROCESSING_MESSAGE   = atom.ensure("processing_message")
+STOPPING             = atom.ensure("stopping")
+CRASHED              = atom.ensure("crashed")
+TERMINATED           = atom.ensure("terminated")
 
 
 # ============================================================================
@@ -33,17 +33,17 @@ TERMINATED           = ensure("terminated")
 # Represent significant internal events in a GenServer lifecycle.
 # Useful for telemetry, logging, or external monitoring.
 
-INIT_SUCCESS         = ensure("init_success")
-INIT_FAILED          = ensure("init_failed")
-MESSAGE_RECEIVED     = ensure("message_received")
-MESSAGE_PROCESSED    = ensure("message_processed")
-STOP_REQUESTED       = ensure("stop_requested")
-HANDLER_STOP         = ensure("handler_stop")
-EXCEPTION_OCCURRED   = ensure("exception_occurred")
-MAILBOX_CLOSED       = ensure("mailbox_closed")
-TIMEOUT_OCCURRED     = ensure("timeout_occurred")
-LINK_DOWN            = ensure("link_down")
-MONITOR_DOWN         = ensure("monitor_down")
+INIT_SUCCESS         = atom.ensure("init_success")
+INIT_FAILED          = atom.ensure("init_failed")
+MESSAGE_RECEIVED     = atom.ensure("message_received")
+MESSAGE_PROCESSED    = atom.ensure("message_processed")
+STOP_REQUESTED       = atom.ensure("stop_requested")
+HANDLER_STOP         = atom.ensure("handler_stop")
+EXCEPTION_OCCURRED   = atom.ensure("exception_occurred")
+MAILBOX_CLOSED       = atom.ensure("mailbox_closed")
+TIMEOUT_OCCURRED     = atom.ensure("timeout_occurred")
+LINK_DOWN            = atom.ensure("link_down")
+MONITOR_DOWN         = atom.ensure("monitor_down")
 
 
 # ============================================================================
@@ -52,11 +52,11 @@ MONITOR_DOWN         = ensure("monitor_down")
 # Actions that a GenServer handler may request, or that supervision
 # may take in response to failure.
 
-CONTINUE             = ensure("continue")
-STOP_ACTION          = ensure("stop")
-CRASH                = ensure("crash")
-RESTART              = ensure("restart")
-IGNORE               = ensure("ignore")
+CONTINUE             = atom.ensure("continue")
+STOP_ACTION          = atom.ensure("stop")
+CRASH                = atom.ensure("crash")
+RESTART              = atom.ensure("restart")
+IGNORE               = atom.ensure("ignore")
 
 
 # ============================================================================
@@ -65,9 +65,9 @@ IGNORE               = ensure("ignore")
 # Classify the three primary kinds of GenServer messages.
 # BEAM uses internal tuples ('$gen_call', '$gen_cast'), we normalize to atoms.
 
-CALL                 = ensure("call")
-CAST                 = ensure("cast")
-INFO                 = ensure("info")
+CALL                 = atom.ensure("call")
+CAST                 = atom.ensure("cast")
+INFO                 = atom.ensure("info")
 
 
 # ============================================================================
@@ -76,18 +76,18 @@ INFO                 = ensure("info")
 # Used as exit reasons when a GenServer handler breaks the OTP contract.
 # Mirrors Erlang/BEAM crash reasons like `badarg`, `bad_return_value`.
 
-BADARITY             = ensure("badarity")    # Handler has wrong number of args
-BADRETURN            = ensure("badreturn")   # Handler returned invalid value
-BADMESSAGE           = ensure("badmessage")  # Unexpected internal message leak
+BADARITY             = atom.ensure("badarity")    # Handler has wrong number of args
+BADRETURN            = atom.ensure("badreturn")   # Handler returned invalid value
+BADMESSAGE           = atom.ensure("badmessage")  # Unexpected internal message leak
 
 
 # ============================================================================
 # Exit Reasons
 # ============================================================================
 # Standardized exit reasons for supervised processes.
-DOWN                 = ensure("down")
-EXIT                 = ensure("exit")
-TIMEOUT              = ensure("timeout")
+DOWN                 = atom.ensure("down")
+EXIT                 = atom.ensure("exit")
+TIMEOUT              = atom.ensure("timeout")
 
 
 # ============================================================================
@@ -95,6 +95,6 @@ TIMEOUT              = ensure("timeout")
 # ============================================================================
 # Standardized exit reason aliases for supervised processes.
 
-NORMAL               = ensure("normal")      # Normal exit
-SHUTDOWN             = ensure("shutdown")    # Graceful supervisor shutdown
-KILLED               = ensure("killed")      # Untrappable kill
+NORMAL               = atom.ensure("normal")      # Normal exit
+SHUTDOWN             = atom.ensure("shutdown")    # Graceful supervisor shutdown
+KILLED               = atom.ensure("killed")      # Untrappable kill

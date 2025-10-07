@@ -246,6 +246,15 @@ class RuntimeBackend(Protocol):
         """
         ...
     
+    def whereis_name(self, pid: str) -> Optional[str]:
+        """
+        Look up a registered name by PID (reverse lookup).
+    
+        :param pid: Process ID
+        :returns: Registered name if found, None otherwise
+        """
+        ...
+    
     def registered(self) -> List[str]:
         """
         Get all registered names.

@@ -10,6 +10,12 @@ import uuid
 from typing import Any, Dict, List, Optional, Union, Callable, Tuple
 from contextvars import ContextVar
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from otpylib.inet.data import Socket, ListenSocket, Address, SocketOptions, ActiveMode
+
+
 from otpylib import atom
 from otpylib.runtime.backends.base import (
     RuntimeBackend, ProcessNotFoundError, NameAlreadyRegisteredError, NotInProcessError
@@ -18,13 +24,20 @@ from otpylib.runtime.data import (
     ProcessInfo, RuntimeStatistics, ProcessCharacteristics, MonitorRef
 )
 from otpylib.runtime.atoms import (
-    RUNNING, WAITING, TERMINATED, NORMAL, KILLED, EXIT, DOWN, SHUTDOWN
+    RUNNING, WAITING, TERMINATED, NORMAL, KILLED, EXIT, DOWN, SHUTDOWN, SUPERVISOR_SHUTDOWN
 )
 from otpylib.runtime.atom_utils import (
     is_normal_exit, format_down_message, format_exit_message
 )
+from otpylib.inet.data import (
+    Socket,
+    ListenSocket,
+    Address,
+    SocketOptions,
+)
 
 from otpylib.runtime.backends.asyncio_backend.process import Process, ProcessMailbox
+from otpylib.runtime.backends.asyncio_backend import tcp
 
 # Logger target
 LOGGER = atom.ensure("logger")
@@ -74,6 +87,7 @@ class AsyncIOBackend(RuntimeBackend):
     ) -> str:
         """Spawn a new process."""
         pid = f"pid_{uuid.uuid4().hex[:12]}"
+
         await self.send(LOGGER, ("log", "DEBUG", f"[spawn] name={name}, pid={pid}", {"name": name, "pid": pid}))
 
         proc = Process(
@@ -164,7 +178,10 @@ class AsyncIOBackend(RuntimeBackend):
                 await self.send(LOGGER, ("log", "DEBUG", f"[exit] Cancelled process {target_pid}",
                                         {"pid": target_pid}))
 
-        await self._notify_exit(target_pid, reason)
+        # Don't call _notify_exit for graceful shutdowns - let _handle_process_exit handle it
+        # This ensures DOWN messages are sent with monitors still intact
+        if reason not in [SHUTDOWN, SUPERVISOR_SHUTDOWN]:
+            await self._notify_exit(target_pid, reason)
 
     async def _notify_exit(self, pid: str, reason: Any, visited: Optional[set] = None) -> None:
         """Propagate exit signals to links and monitors with cycle protection."""
@@ -223,10 +240,12 @@ class AsyncIOBackend(RuntimeBackend):
     async def link(self, target_pid: str) -> None:
         """Create a bidirectional link (BEAM-style parity)."""
         self_pid = self.self()
+
         if not self_pid:
             raise NotInProcessError("link() must be called from within a process")
 
         target_pid = self._name_registry.get(target_pid, target_pid)
+
         if target_pid not in self._processes:
             await self.send(LOGGER, ("log", "DEBUG", f"[link] {self_pid} -> {target_pid} failed (not found)",
                                     {"self": self_pid, "target": target_pid}))
@@ -234,24 +253,10 @@ class AsyncIOBackend(RuntimeBackend):
 
         self._processes[self_pid].links.add(target_pid)
         self._processes[target_pid].links.add(self_pid)
+
         await self.send(LOGGER, ("log", "DEBUG", f"[link] {self_pid} <-> {target_pid}",
                                 {"self": self_pid, "target": target_pid}))
 
-    async def unlink(self, target_pid: str) -> None:
-        """Remove an existing link (symmetric, BEAM parity)."""
-        self_pid = self.self()
-        if not self_pid:
-            raise NotInProcessError("unlink() must be called from within a process")
-
-        target_pid = self._name_registry.get(target_pid, target_pid)
-
-        if self_pid in self._processes:
-            self._processes[self_pid].links.discard(target_pid)
-        if target_pid in self._processes:
-            self._processes[target_pid].links.discard(self_pid)
-
-        await self.send(LOGGER, ("log", "DEBUG", f"[unlink] {self_pid} -X- {target_pid}",
-                                {"self": self_pid, "target": target_pid}))
 
     async def monitor(self, target_pid: str) -> str:
         """Create a monitor (unidirectional). Returns the monitor ref."""
@@ -384,6 +389,13 @@ class AsyncIOBackend(RuntimeBackend):
             return None
         return pid
 
+    def whereis_name(self, pid: str) -> Optional[str]:
+        """Get the registered name for a PID (reverse lookup)."""
+        process = self._processes.get(pid)
+        if process:
+            return process.name
+        return None
+
     def registered(self) -> List[str]:
         """Return all registered process names."""
         return list(self._name_registry.keys())
@@ -453,31 +465,39 @@ class AsyncIOBackend(RuntimeBackend):
     # =========================================================================
 
     async def _handle_process_exit(self, pid: str, reason: Any) -> None:
+        """Handle process exit: notify links and monitors."""
         proc = self._processes.get(pid)
         if not proc:
             return
-
+    
         await self.send(LOGGER, ("log", "DEBUG", f"[exit] handling {pid} reason={reason}",
                                 {"pid": pid, "reason": str(reason)}))
         await self.send(LOGGER, ("log", "DEBUG", 
             f"[exit/debug] proc.monitors={dict(proc.monitors)} proc.monitored_by={dict(proc.monitored_by)}",
             {"monitors": dict(proc.monitors), "monitored_by": dict(proc.monitored_by)}))
-
+    
         if reason is KILLED:
             await self.send(LOGGER, ("log", "DEBUG", f"[exit] {pid} hard-killed (reason=KILLED)", {"pid": pid}))
             return
-
-        if self._is_normal_exit(reason):
+    
+        is_normal = self._is_normal_exit(reason)
+        
+        if is_normal:
             await self.send(LOGGER, ("log", "DEBUG", f"[exit] {pid} exited normally, skipping link cascade",
                                     {"pid": pid}))
         else:
+            # Process links for abnormal exits
             for linked_pid in list(proc.links):
                 if not self.is_alive(linked_pid):
                     continue
-
+                
                 linked = self._processes.get(linked_pid)
-                if linked and linked.trap_exits:
-                    await self.send(linked_pid, (EXIT, pid, reason))
+                if not linked:
+                    continue
+                
+                if linked.trap_exits:
+                    exit_msg = (EXIT, pid, reason)
+                    await self.send(linked_pid, exit_msg)
                     await self.send(LOGGER, ("log", "DEBUG", 
                         f"[exit/link] sent EXIT to {linked_pid} from {pid} reason={reason}",
                         {"linked": linked_pid, "pid": pid, "reason": str(reason)}))
@@ -485,11 +505,12 @@ class AsyncIOBackend(RuntimeBackend):
                     await self.send(LOGGER, ("log", "DEBUG", f"[exit/link] cancelling linked {linked_pid} (reason={reason})",
                                             {"linked": linked_pid, "reason": str(reason)}))
                     await self.exit(linked_pid, reason)
-
+    
+        # Process monitors
         if not proc.monitored_by:
             await self.send(LOGGER, ("log", "DEBUG", f"[exit/debug] no watchers in proc={pid}.monitored_by",
                                     {"pid": pid}))
-
+    
         for monitor_ref, mon_pid in list(proc.monitored_by.items()):
             if self.is_alive(mon_pid):
                 msg = (DOWN, monitor_ref, atom.ensure("process"), pid, reason)
@@ -497,7 +518,7 @@ class AsyncIOBackend(RuntimeBackend):
                 await self.send(LOGGER, ("log", "DEBUG",
                     f"[exit/monitor] sent DOWN to {mon_pid} (ref={monitor_ref}, target={pid}, reason={reason})",
                     {"watcher": mon_pid, "ref": monitor_ref, "target": pid, "reason": str(reason)}))
-
+    
             watcher_proc = self._processes.get(mon_pid)
             if watcher_proc and monitor_ref in watcher_proc.monitors:
                 del watcher_proc.monitors[monitor_ref]
@@ -545,3 +566,76 @@ class AsyncIOBackend(RuntimeBackend):
         self._startup_time = time.time()
 
         await self.send(LOGGER, ("log", "DEBUG", "[reset] AsyncIOBackend reset complete", {}))
+
+    # =========================================================================
+    # TCP/IP Networking (inet support)
+    # =========================================================================
+
+    async def tcp_connect(self, host: str, port: int, options: SocketOptions) -> Socket:
+        """Connect to TCP endpoint."""
+        return await tcp.connect(host, port, options)
+
+    async def tcp_listen(self, port: int, options: SocketOptions) -> ListenSocket:
+        """Create listening TCP socket."""
+        return await tcp.listen(port, options)
+
+    async def tcp_accept(self, listen_socket: ListenSocket, timeout: Optional[float] = None) -> Socket:
+        """Accept connection from listening socket."""
+        return await tcp.accept(listen_socket, timeout)
+
+    async def tcp_send(self, socket: Socket, data: bytes) -> None:
+        """Send data on TCP socket."""
+        return await tcp.send(socket, data)
+
+    async def tcp_recv(self, socket: Socket, length: int, timeout: Optional[float]) -> bytes:
+        """Receive data from TCP socket."""
+        return await tcp.recv(socket, length, timeout)
+
+    async def tcp_close(self, socket: Socket) -> None:
+        """Close TCP socket."""
+        return await tcp.close(socket)
+
+    async def tcp_shutdown(self, socket: Socket, how: str) -> None:
+        """Shutdown part of connection."""
+        return await tcp.shutdown(socket, how)
+
+    async def tcp_peername(self, socket: Socket) -> Address:
+        """Get remote address."""
+        return await tcp.peername(socket)
+
+    async def tcp_sockname(self, socket: Socket) -> Address:
+        """Get local address."""
+        return await tcp.sockname(socket)
+
+    async def tcp_setopts(self, socket: Socket, options: SocketOptions) -> None:
+        """Set socket options, handling active mode changes."""
+        # Check if active mode is changing
+        old_options = socket.options
+        old_active = old_options.active if old_options else ActiveMode.PASSIVE
+        new_active = options.active
+
+        if old_active != new_active:
+            # Active mode changed - enable/disable reader
+            controlling_pid = self.self()
+            if not controlling_pid:
+                # If not in a process context, can't enable active mode
+                if new_active != ActiveMode.PASSIVE:
+                    raise NotInProcessError("Cannot enable active mode outside process context")
+            else:
+                # Enable or disable active mode
+                await tcp.set_active_mode(
+                    socket,
+                    new_active == ActiveMode.ACTIVE,
+                    controlling_pid,
+                    self
+                )
+
+        return await tcp.setopts(socket, options)
+
+    async def tcp_getopts(self, socket: Socket) -> SocketOptions:
+        """Get socket options."""
+        return await tcp.getopts(socket)
+
+    async def tcp_controlling_process(self, socket: Socket, pid: str) -> None:
+        """Change controlling process for active mode."""
+        return await tcp.controlling_process(socket, pid, self)

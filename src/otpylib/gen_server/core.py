@@ -1,12 +1,17 @@
 """
-Generic Server using Process API
+Module-aware Generic Server (gen_server)
 
-Strict BEAM-aligned: no global state registry.
-Each GenServer owns its own state; other processes cannot reach in.
+Adapted from gen_server to work with OTPModule metaclass-based modules.
+Uses module metadata and validates behavior contracts.
+
+Differences from gen_server:
+- Accepts OTPModule classes instead of ModuleType
+- Uses __callbacks__ metadata instead of getattr
+- Validates GEN_SERVER behavior before starting
+- Creates module instances (not just module references)
 """
 
 from typing import TypeVar, Union, Optional, Any, Dict
-from types import ModuleType
 import time
 import uuid
 import asyncio
@@ -21,6 +26,13 @@ from otpylib.gen_server.atoms import (
     TIMEOUT,
 )
 from otpylib.gen_server.data import Reply, NoReply, Stop
+from otpylib.module import (
+    OTPModule,
+    GEN_SERVER,
+    is_otp_module,
+    get_behavior,
+    ModuleError
+)
 
 # Logger target atom
 LOGGER = atom.ensure("logger")
@@ -61,6 +73,16 @@ class GenServerExited(Exception):
         self.reason = reason
 
 
+class NotAGenServerError(ModuleError):
+    """Module is not a gen_server behavior."""
+    def __init__(self, module_class: type):
+        behavior = get_behavior(module_class) if is_otp_module(module_class) else None
+        super().__init__(
+            f"Module {module_class.__name__} is not a gen_server "
+            f"(behavior: {behavior.name if behavior else 'unknown'})"
+        )
+
+
 # ============================================================================
 # Internal Messages
 # ============================================================================
@@ -78,18 +100,47 @@ class _CastMessage:
 
 
 # ============================================================================
+# Module Validation
+# ============================================================================
+
+def _validate_gen_server_module(module_class: type) -> None:
+    """
+    Validate that a class is an OTPModule with gen_server behavior.
+    Raises NotAGenServerError if validation fails.
+    """
+    if not is_otp_module(module_class):
+        raise NotAGenServerError(module_class)
+    
+    behavior = get_behavior(module_class)
+    if behavior != GEN_SERVER:
+        raise NotAGenServerError(module_class)
+
+
+# ============================================================================
 # Public API
 # ============================================================================
 
-async def start(module: ModuleType, init_arg: Optional[Any] = None, name: Optional[str] = None) -> str:
-    """Start a GenServer process (unlinked)."""
+async def start(module_class: type, init_arg: Optional[Any] = None, name: Optional[str] = None) -> str:
+    """
+    Start a GenServer process (unlinked).
+    
+    Args:
+        module_class: OTPModule class with gen_server behavior
+        init_arg: Argument passed to init callback
+        name: Optional registered name for the process
+    
+    Returns:
+        Process PID
+    """
+    _validate_gen_server_module(module_class)
+    
     caller_pid = process.self()
     if not caller_pid:
         raise RuntimeError("gen_server.start() must be called from within a process")
 
     pid = await process.spawn(
         _gen_server_loop,
-        args=[module, init_arg, caller_pid],
+        args=[module_class, init_arg, caller_pid],
         name=name,
         mailbox=True,
     )
@@ -106,7 +157,7 @@ async def start(module: ModuleType, init_arg: Optional[Any] = None, name: Option
                     for buffered_msg in buffered_messages:
                         await process.send(caller_pid, buffered_msg)
                     
-                    modname = getattr(module, "name", getattr(module, "__name__", str(module)))
+                    modname = module_class.__mod_id__
                     await process.send(LOGGER, ("log", "DEBUG",
                         f"[gen_server.start] module={modname}, name={name}, pid={pid} init ok",
                         {"module": modname, "pid": pid, "name": name}))
@@ -115,12 +166,12 @@ async def start(module: ModuleType, init_arg: Optional[Any] = None, name: Option
                     # Re-inject buffered messages even on error
                     for buffered_msg in buffered_messages:
                         await process.send(caller_pid, buffered_msg)
-                    raise RuntimeError(f"[gen_server.start] module={module} pid={pid} init failed: {reason}")
+                    raise RuntimeError(f"[gen_server.start] module={modname} pid={pid} init failed: {reason}")
                 case ("gen_server_init_ok", init_pid) | ("gen_server_init_error", init_pid, _):
-                    # Init message for a different pid - this is unexpected, preserve original error
+                    # Init message for a different pid - this is unexpected
                     for buffered_msg in buffered_messages:
                         await process.send(caller_pid, buffered_msg)
-                    raise RuntimeError(f"[gen_server.start] module={module} pid={pid} unexpected init reply: {msg}")
+                    raise RuntimeError(f"[gen_server.start] unexpected init reply: {msg}")
                 case _:
                     # Not an init message - buffer it and keep waiting
                     buffered_messages.append(msg)
@@ -128,18 +179,30 @@ async def start(module: ModuleType, init_arg: Optional[Any] = None, name: Option
         # Re-inject buffered messages on timeout too
         for buffered_msg in buffered_messages:
             await process.send(caller_pid, buffered_msg)
-        raise TimeoutError(f"[gen_server.start] module={module} pid={pid} init timeout after 5.0s")
+        raise TimeoutError(f"[gen_server.start] module={module_class.__mod_id__} pid={pid} init timeout after 5.0s")
 
 
-async def start_link(module: ModuleType, init_arg: Optional[Any] = None, name: Optional[str] = None) -> str:
-    """Start a GenServer process linked to the caller."""
+async def start_link(module_class: type, init_arg: Optional[Any] = None, name: Optional[str] = None) -> str:
+    """
+    Start a GenServer process linked to the caller.
+    
+    Args:
+        module_class: OTPModule class with gen_server behavior
+        init_arg: Argument passed to init callback
+        name: Optional registered name for the process
+    
+    Returns:
+        Process PID
+    """
+    _validate_gen_server_module(module_class)
+    
     caller_pid = process.self()
     if not caller_pid:
         raise RuntimeError("gen_server.start_link() must be called from within a process")
 
     pid = await process.spawn_link(
         _gen_server_loop,
-        args=[module, init_arg, caller_pid],
+        args=[module_class, init_arg, caller_pid],
         name=name,
         mailbox=True,
     )
@@ -156,7 +219,7 @@ async def start_link(module: ModuleType, init_arg: Optional[Any] = None, name: O
                     for buffered_msg in buffered_messages:
                         await process.send(caller_pid, buffered_msg)
                     
-                    modname = getattr(module, "name", getattr(module, "__name__", str(module)))
+                    modname = module_class.__mod_id__
                     await process.send(LOGGER, ("log", "DEBUG",
                         f"[gen_server.start_link] module={modname}, name={name}, pid={pid} init ok",
                         {"module": modname, "pid": pid, "name": name}))
@@ -165,12 +228,12 @@ async def start_link(module: ModuleType, init_arg: Optional[Any] = None, name: O
                     # Re-inject buffered messages even on error
                     for buffered_msg in buffered_messages:
                         await process.send(caller_pid, buffered_msg)
-                    raise RuntimeError(f"[gen_server.start_link] module={module} pid={pid} init failed: {reason}")
+                    raise RuntimeError(f"[gen_server.start_link] module={module_class.__mod_id__} pid={pid} init failed: {reason}")
                 case ("gen_server_init_ok", init_pid) | ("gen_server_init_error", init_pid, _):
-                    # Init message for a different pid - this is unexpected, preserve original error
+                    # Init message for a different pid - this is unexpected
                     for buffered_msg in buffered_messages:
                         await process.send(caller_pid, buffered_msg)
-                    raise RuntimeError(f"[gen_server.start_link] module={module} pid={pid} unexpected init reply: {msg}")
+                    raise RuntimeError(f"[gen_server.start_link] unexpected init reply: {msg}")
                 case _:
                     # Not an init message - buffer it and keep waiting
                     buffered_messages.append(msg)
@@ -178,7 +241,7 @@ async def start_link(module: ModuleType, init_arg: Optional[Any] = None, name: O
         # Re-inject buffered messages on timeout too
         for buffered_msg in buffered_messages:
             await process.send(caller_pid, buffered_msg)
-        raise TimeoutError(f"[gen_server.start_link] module={module} pid={pid} init timeout after 5.0s")
+        raise TimeoutError(f"[gen_server.start_link] module={module_class.__mod_id__} pid={pid} init timeout after 5.0s")
 
 
 async def call(target: Union[str, str], payload: Any, timeout: Optional[float] = None) -> Any:
@@ -287,18 +350,29 @@ async def _call_from_outside_process(target: str, payload: Any, timeout: Optiona
 # GenServer loop
 # ============================================================================
 
-async def _gen_server_loop(module: ModuleType, init_arg: Any, caller_pid: str) -> None:
+async def _gen_server_loop(module_class: type, init_arg: Any, caller_pid: str) -> None:
+    """
+    Main GenServer loop - creates module instance and processes messages.
+    
+    Key difference from gen_server: Creates an instance of the module class
+    so callbacks are called as methods on that instance.
+    """
     pid = process.self()
-    modname = getattr(module, "name", getattr(module, "__name__", str(module)))
+    modname = module_class.__mod_id__
 
     # --- Init handshake ---
     try:
-        init_fn = getattr(module, "init", None)
-        if init_fn is None:
-            await process.send(caller_pid, ("gen_server_init_error", pid, "no init/1 defined"))
+        # Create module instance first
+        module_instance = module_class()
+        
+        # Get init callback - it's stored as an unbound function in __callbacks__
+        # We need to get the bound method from the instance instead
+        if not hasattr(module_instance, 'init'):
+            await process.send(caller_pid, ("gen_server_init_error", pid, "no init callback defined"))
             return
-
-        result = await init_fn(init_arg)
+        
+        # Call init as a bound method
+        result = await module_instance.init(init_arg)
         state = result  # allow simple `return state`
 
         await process.send(caller_pid, ("gen_server_init_ok", pid))
@@ -317,21 +391,23 @@ async def _gen_server_loop(module: ModuleType, init_arg: Any, caller_pid: str) -
             try:
                 match msg:
                     case _CallMessage() as call:
-                        state = await _handle_call(module, call, state)
+                        state = await _handle_call(module_instance, module_class, call, state)
                     case _CastMessage() as cast_msg:
-                        state = await _handle_cast(module, cast_msg, state)
+                        state = await _handle_cast(module_instance, module_class, cast_msg, state)
                     case (action, reason) if action == STOP_ACTION:
                         await process.send(LOGGER, ("log", "DEBUG",
                             f"[gen_server.loop] module={modname}, pid={pid} stop requested: {reason}",
                             {"module": modname, "pid": pid, "reason": reason}))
                         raise GenServerExited(reason)
                     case _:
-                        state = await _handle_info(module, msg, state)
+                        state = await _handle_info(module_instance, module_class, msg, state)
 
             except Exception as e:
+                print(f"[gen_server] Process {pid} caught exception in message handler: {type(e).__name__}: {e}")
                 await process.send(LOGGER, ("log", "ERROR",
                     f"[gen_server.loop] module={modname}, pid={pid} crashed with {repr(e)}",
                     {"module": modname, "pid": pid, "exception": repr(e)}))
+                print(f"[gen_server] Process {pid} about to re-raise exception and die")
                 raise
 
     except GenServerExited as e:
@@ -350,14 +426,17 @@ async def _gen_server_loop(module: ModuleType, init_arg: Any, caller_pid: str) -
 # Message handlers
 # ============================================================================
 
-async def _handle_call(module, message, state):
-    handler = getattr(module, "handle_call", None)
-    if handler is None:
+async def _handle_call(module_instance, module_class, message, state):
+    """
+    Handle call message using module's handle_call callback.
+    """
+    if not hasattr(module_instance, 'handle_call'):
         error = NotImplementedError("handle_call not implemented")
         await process.send(message.reply_to, (message.call_id, error))
         return state
 
-    result = await handler(message.payload, (message.reply_to, message.call_id), state)
+    # Call handler as bound method
+    result = await module_instance.handle_call(message.payload, (message.reply_to, message.call_id), state)
 
     match result:
         case (Reply(payload=payload), new_state):
@@ -372,12 +451,12 @@ async def _handle_call(module, message, state):
             raise GenServerBadReturn(result)
 
 
-async def _handle_cast(module, message: _CastMessage, state: Any) -> Any:
-    handler = getattr(module, "handle_cast", None)
-    if handler is None:
+async def _handle_cast(module_instance, module_class, message: _CastMessage, state: Any) -> Any:
+    """Handle cast message using module's handle_cast callback."""
+    if not hasattr(module_instance, 'handle_cast'):
         return state
 
-    result = await handler(message.payload, state)
+    result = await module_instance.handle_cast(message.payload, state)
 
     match result:
         case (NoReply(), new_state):
@@ -388,12 +467,12 @@ async def _handle_cast(module, message: _CastMessage, state: Any) -> Any:
             raise GenServerBadReturn(result)
 
 
-async def _handle_info(module: ModuleType, message: Any, state: Any) -> Any:
-    handler = getattr(module, "handle_info", None)
-    if handler is None:
+async def _handle_info(module_instance, module_class, message: Any, state: Any) -> Any:
+    """Handle info message using module's handle_info callback."""
+    if not hasattr(module_instance, 'handle_info'):
         return state
 
-    result = await handler(message, state)
+    result = await module_instance.handle_info(message, state)
 
     match result:
         case (NoReply(), new_state):
@@ -408,12 +487,14 @@ async def _handle_info(module: ModuleType, message: Any, state: Any) -> Any:
 # Termination
 # ============================================================================
 
-async def _terminate(module, reason, state):
-    handler = getattr(module, "terminate", None)
-    modname = getattr(module, "name", getattr(module, "__name__", str(module)))
+async def _terminate(module_instance, module_class, reason, state):
+    """Call terminate callback if defined."""
+    handler = module_class.__callbacks__.get('terminate')
+    modname = module_class.__mod_id__
+    
     if handler is not None:
         try:
-            await handler(reason, state)
+            await handler(module_instance, reason, state)
         except Exception as e:
             await process.send(LOGGER, ("log", "ERROR",
                 f"[gen_server.terminate] module={modname}, pid={process.self()} error in terminate handler: {e}",

@@ -1,60 +1,42 @@
 """
-Dynamic supervisor for managing both static and dynamically added children.
+Dynamic supervisor for managing OTPModule children with runtime add/remove capability.
 
-Uses the process API for BEAM-style supervision with the ability to add/remove
-children at runtime via message passing.
+Module-aware version of dynamic_supervisor that works exclusively with OTPModule classes.
 """
 
-from collections.abc import Callable, Awaitable
 from typing import Any, Dict, List, Optional, Tuple
 import time
 from collections import deque
 from dataclasses import dataclass, field
 
 from otpylib import process
+from otpylib.module import get_behavior, is_otp_module, ModuleError
 
 from otpylib.dynamic_supervisor.atoms import (
-    # Restart Strategy Atoms
     PERMANENT, TRANSIENT, TEMPORARY,
-
-    # Supervisor Strategy Atoms
     ONE_FOR_ONE, ONE_FOR_ALL, REST_FOR_ONE,
-
-    # Exit Reason Atoms
-    NORMAL, SHUTDOWN, KILLED, SUPERVISOR_SHUTDOWN, SIBLING_RESTART_LIMIT,
-
-    # Supervisor State Atoms
-    STARTING, RUNNING, SHUTTING_DOWN, TERMINATED,
-
-    # Dynamic Supervisor Message Atoms
-    GET_CHILD_STATUS, LIST_CHILDREN, WHICH_CHILDREN, COUNT_CHILDREN,
-    ADD_CHILD, TERMINATE_CHILD, RESTART_CHILD,
-
-    # Process Message Atoms
-    EXIT, DOWN, PROCESS,
-
-    # Child Types
-    WORKER, SUPERVISOR,
-
-    # Dynamic Supervisor Specific
-    DYNAMIC, STATIC,
+    NORMAL, SHUTDOWN, KILLED, SUPERVISOR_SHUTDOWN,
+    EXIT, DOWN,
 )
 
 
+# ============================================================================
+# Data Structures
+# ============================================================================
+
 @dataclass
 class child_spec:
+    """Child specification for module-based dynamic supervisors."""
     id: str
-    func: Callable[..., Awaitable[None]]
-    args: List[Any] = field(default_factory=list)
-    kwargs: Dict[str, Any] = field(default_factory=dict)
+    module: type  # OTPModule class
+    args: Any = None
     restart: Any = PERMANENT
     name: Optional[str] = None
-    type: str = "worker"
-    modules: List[str] = field(default_factory=list)
 
 
 @dataclass
 class options:
+    """Supervisor options."""
     max_restarts: int = 3
     max_seconds: int = 5
     strategy: Any = ONE_FOR_ONE
@@ -62,6 +44,7 @@ class options:
 
 @dataclass
 class _ChildState:
+    """Internal state for tracking a child process."""
     spec: child_spec
     pid: Optional[str] = None
     monitor_ref: Optional[str] = None
@@ -71,305 +54,319 @@ class _ChildState:
     is_dynamic: bool = False
 
 
-class DynamicSupervisorHandle:
-    def __init__(self, supervisor_pid: str):
-        self.supervisor_pid = supervisor_pid
-    
-    async def get_child_status(self, child_id: str) -> Optional[Dict[str, Any]]:
-        await process.send(self.supervisor_pid, (GET_CHILD_STATUS, child_id, process.self()))
-        return await process.receive(timeout=5.0)
-    
-    async def list_children(self) -> List[str]:
-        await process.send(self.supervisor_pid, (LIST_CHILDREN, process.self()))
-        return await process.receive(timeout=5.0)
-    
-    async def which_children(self) -> List[Dict[str, Any]]:
-        await process.send(self.supervisor_pid, (WHICH_CHILDREN, process.self()))
-        return await process.receive(timeout=5.0)
-    
-    async def count_children(self) -> Dict[str, int]:
-        await process.send(self.supervisor_pid, (COUNT_CHILDREN, process.self()))
-        return await process.receive(timeout=5.0)
-    
-    async def start_child(self, child_spec: child_spec) -> Tuple[bool, str]:
-        await process.send(self.supervisor_pid, (ADD_CHILD, child_spec, process.self()))
-        return await process.receive(timeout=5.0)
-    
-    async def terminate_child(self, child_id: str) -> Tuple[bool, str]:
-        await process.send(self.supervisor_pid, (TERMINATE_CHILD, child_id, process.self()))
-        return await process.receive(timeout=5.0)
-    
-    async def restart_child(self, child_id: str) -> Tuple[bool, str]:
-        child_state = await self.get_child_status(child_id)
-        if child_state and child_state.get("pid"):
-            await process.exit(child_state["pid"], KILLED)
-            return True, "restart_initiated"
-        return False, "child_not_found"
-    
-    async def shutdown(self):
-        await process.exit(self.supervisor_pid, SHUTDOWN)
+# ============================================================================
+# Supervisor Control Messages
+# ============================================================================
+
+# Message atoms
+_GET_CHILD_STATUS = "get_child_status"
+_LIST_CHILDREN = "list_children"
+_WHICH_CHILDREN = "which_children"
+_COUNT_CHILDREN = "count_children"
+_ADD_CHILD = "add_child"
+_TERMINATE_CHILD = "terminate_child"
 
 
-async def start(child_specs: List[child_spec], opts: options = options(), name: Optional[str] = None) -> str:
+# ============================================================================
+# Public API
+# ============================================================================
+
+async def start(
+    child_specs: List[child_spec],
+    opts: options = options(),
+    name: Optional[str] = None
+) -> str:
+    """
+    Start a dynamic supervisor (not linked to caller).
+    
+    Args:
+        child_specs: List of initial static children
+        opts: Supervisor options
+        name: Optional registered name
+    
+    Returns:
+        Supervisor PID
+    """
     return await process.spawn(
         _dynamic_supervisor_loop,
         args=[child_specs, opts],
         name=name,
         mailbox=True,
+        trap_exits=True,  # CRITICAL: Must trap exits to survive child crashes
     )
 
 
-async def start_link(child_specs: List[child_spec], opts: options = options(), name: Optional[str] = None) -> str:
+async def start_link(
+    child_specs: List[child_spec],
+    opts: options = options(),
+    name: Optional[str] = None
+) -> str:
+    """
+    Start a dynamic supervisor linked to the caller.
+    
+    Args:
+        child_specs: List of initial static children
+        opts: Supervisor options
+        name: Optional registered name
+    
+    Returns:
+        Supervisor PID
+    """
     return await process.spawn_link(
         _dynamic_supervisor_loop,
         args=[child_specs, opts],
         name=name,
         mailbox=True,
+        trap_exits=True,  # CRITICAL: Must trap exits to survive child crashes
     )
 
 
+async def start_child(supervisor_pid: str, spec: child_spec) -> Tuple[bool, str]:
+    """
+    Dynamically add and start a child under the supervisor.
+    
+    Args:
+        supervisor_pid: PID or name of the supervisor
+        spec: Child specification
+    
+    Returns:
+        Tuple of (success, message)
+    """
+    await process.send(supervisor_pid, (_ADD_CHILD, spec, process.self()))
+    return await process.receive(timeout=5.0)
+
+
+async def terminate_child(supervisor_pid: str, child_id: str) -> Tuple[bool, str]:
+    """
+    Terminate a dynamic child (static children cannot be terminated).
+    
+    Args:
+        supervisor_pid: PID or name of the supervisor
+        child_id: ID of the child to terminate
+    
+    Returns:
+        Tuple of (success, message)
+    """
+    await process.send(supervisor_pid, (_TERMINATE_CHILD, child_id, process.self()))
+    return await process.receive(timeout=5.0)
+
+
+async def list_children(supervisor_pid: str) -> List[str]:
+    """
+    Get a list of all child IDs.
+    
+    Args:
+        supervisor_pid: PID or name of the supervisor
+    
+    Returns:
+        List of child IDs
+    """
+    await process.send(supervisor_pid, (_LIST_CHILDREN, process.self()))
+    return await process.receive(timeout=5.0)
+
+
+async def which_children(supervisor_pid: str) -> List[Dict[str, Any]]:
+    """
+    Get detailed information about all children.
+    
+    Args:
+        supervisor_pid: PID or name of the supervisor
+    
+    Returns:
+        List of child info dictionaries
+    """
+    await process.send(supervisor_pid, (_WHICH_CHILDREN, process.self()))
+    return await process.receive(timeout=5.0)
+
+
+async def count_children(supervisor_pid: str) -> Dict[str, int]:
+    """
+    Get counts of children by various categories.
+    
+    Args:
+        supervisor_pid: PID or name of the supervisor
+    
+    Returns:
+        Dictionary with counts (specs, active, dynamic, static)
+    """
+    await process.send(supervisor_pid, (_COUNT_CHILDREN, process.self()))
+    return await process.receive(timeout=5.0)
+
+
+# ============================================================================
+# Supervisor Loop
+# ============================================================================
+
 async def _dynamic_supervisor_loop(child_specs: List[child_spec], opts: options):
+    """Main supervisor loop for dynamic supervision."""
     children: Dict[str, _ChildState] = {}
     start_order: List[str] = []
     dynamic_children: List[str] = []
-    pending_terminations: Dict[str, str] = {}   # child_id -> reply_to
+    pending_terminations: Dict[str, str] = {}  # child_id -> reply_to
     shutting_down = False
-
-    print("[SUP LOOP] initializing supervisor")
-
-    # preload static children
+    
+    # Validate and load static children
     for spec in child_specs:
-        print(f"[SUP LOOP] preload static child spec id={spec.id}")
+        _validate_child_spec(spec)
         children[spec.id] = _ChildState(spec=spec, is_dynamic=False)
         start_order.append(spec.id)
-
+    
+    # Start all static children
     for child_id in start_order:
-        print(f"[SUP LOOP] starting static child id={child_id}")
         await _start_child(children[child_id])
-        print(f"[SUP LOOP] started static child id={child_id}, pid={children[child_id].pid}")
-
+    
+    # Main message loop
     while not shutting_down:
         try:
             msg = await process.receive()
-            print(f"[SUP LOOP] received msg={msg}")
-
+            
             match msg:
-                # Exit signal
+                # Exit signal from linked child
                 case (msg_type, from_pid, reason) if msg_type == EXIT:
-                    shutting_down = await _handle_exit(
-                        children, from_pid, reason,
-                        opts, start_order, dynamic_children,
-                        pending_terminations
-                    )
-
-                # Monitor DOWN
+                    # Supervisor traps exits, so we just ignore them
+                    # The DOWN message from the monitor will handle restart
+                    pass
+                
+                # Monitor DOWN - child exited
                 case (msg_type, ref, _, pid, reason) if msg_type == DOWN:
                     shutting_down = await _handle_down(
-                        children, ref, pid, reason,
-                        opts, start_order, dynamic_children,
-                        pending_terminations
+                        children, ref, pid, reason, opts,
+                        start_order, dynamic_children, pending_terminations
                     )
-
+                
                 # Add dynamic child
-                case (msg_type, spec, reply_to) if msg_type == ADD_CHILD:
+                case (msg_type, spec, reply_to) if msg_type == _ADD_CHILD:
                     await _handle_add_child(children, dynamic_children, spec, reply_to)
-
+                
                 # Terminate dynamic child
-                case (msg_type, child_id, reply_to) if msg_type == TERMINATE_CHILD:
+                case (msg_type, child_id, reply_to) if msg_type == _TERMINATE_CHILD:
                     await _handle_terminate_child(children, child_id, reply_to, pending_terminations)
-
-                # Query child status
-                case (msg_type, child_id, reply_to) if msg_type == GET_CHILD_STATUS:
+                
+                # Query operations
+                case (msg_type, child_id, reply_to) if msg_type == _GET_CHILD_STATUS:
                     await _handle_get_child_status(children, child_id, reply_to)
-
-                # List children
-                case (msg_type, reply_to) if msg_type == LIST_CHILDREN:
+                
+                case (msg_type, reply_to) if msg_type == _LIST_CHILDREN:
                     await _handle_list_children(children, reply_to)
-
-                # Which children
-                case (msg_type, reply_to) if msg_type == WHICH_CHILDREN:
+                
+                case (msg_type, reply_to) if msg_type == _WHICH_CHILDREN:
                     await _handle_which_children(children, reply_to)
-
-                # Count children
-                case (msg_type, reply_to) if msg_type == COUNT_CHILDREN:
+                
+                case (msg_type, reply_to) if msg_type == _COUNT_CHILDREN:
                     await _handle_count_children(children, reply_to)
-
-                # Shutdown supervisor
+                
+                # Shutdown
                 case msg_type if msg_type == SHUTDOWN:
-                    print("[SUP LOOP] shutdown requested")
                     shutting_down = True
-
-                # Fallback
+                
                 case _:
-                    print(f"[SUP LOOP] unhandled msg={msg}")
-
+                    # Ignore unknown messages
+                    pass
+        
         except Exception as e:
             import traceback
-            print(f"[SUP LOOP] EXCEPTION: {e}")
+            print(f"[dynamic_supervisor] ERROR in main loop: {e}")
             traceback.print_exc()
-
-    # Supervisor shutdown: kill children
-    print("[SUP LOOP] supervisor shutting down, killing children")
-    for child in children.values():
-        if child.pid and process.is_alive(child.pid):
-            print(f"[SUP LOOP] killing child id={child.spec.id} pid={child.pid}")
-            await process.exit(child.pid, SUPERVISOR_SHUTDOWN)
+    
+    # Shutdown: terminate all children
+    await _shutdown_children(children)
 
 
-# ----------------------------------------------------------------------
-# Handlers
-# ----------------------------------------------------------------------
+# ============================================================================
+# Child Management
+# ============================================================================
 
-async def _handle_exit(children, from_pid, reason, opts, start_order, dynamic_children, pending_terminations):
-    print(f"[SUP EXIT] pid={from_pid}, reason={reason}")
-    child_id = next((cid for cid, c in children.items() if c.pid == from_pid), None)
-    if child_id:
-        print(f"[SUP EXIT] matched child_id={child_id}")
-        await _handle_child_exit(children, child_id, reason, opts, start_order, dynamic_children)
-        if child_id in pending_terminations:
-            reply_to = pending_terminations.pop(child_id)
-            print(f"[SUP EXIT] reply terminate ack for child={child_id}")
-            await process.send(reply_to, (True, f"Child {child_id} terminated successfully"))
-    return False
-
-
-async def _handle_down(children, ref, pid, reason, opts, start_order, dynamic_children, pending_terminations):
-    print(f"[SUP DOWN] ref={ref}, pid={pid}, reason={reason}")
-    child_id = next((cid for cid, c in children.items() if c.monitor_ref == ref), None)
-    if child_id:
-        print(f"[SUP DOWN] matched child_id={child_id}")
-        await _handle_child_exit(children, child_id, reason, opts, start_order, dynamic_children)
-        if child_id in pending_terminations:
-            reply_to = pending_terminations.pop(child_id)
-            print(f"[SUP DOWN] reply terminate ack for child={child_id}")
-            await process.send(reply_to, (True, f"Child {child_id} terminated successfully"))
-    return False
-
-
-async def _handle_add_child(children, dynamic_children, spec, reply_to):
-    print(f"[SUP ADD_CHILD] request for child_id={spec.id}")
-    success, message = await _add_child(children, dynamic_children, spec)
-    print(f"[SUP ADD_CHILD] result for id={spec.id}: success={success}, message={message}")
-    await process.send(reply_to, (success, message))
-
-
-async def _handle_terminate_child(children, child_id, reply_to, pending_terminations):
-    print(f"[SUP TERMINATE_CHILD] request id={child_id}")
-    child = children.get(child_id)
-    if not child:
-        print(f"[SUP TERMINATE_CHILD] child {child_id} not found")
-        await process.send(reply_to, (False, f"Child {child_id} not found"))
-    elif not child.is_dynamic:
-        print(f"[SUP TERMINATE_CHILD] cannot terminate static child {child_id}")
-        await process.send(reply_to, (False, f"Cannot terminate static child {child_id}"))
-    elif child.pid and process.is_alive(child.pid):
-        print(f"[SUP TERMINATE_CHILD] sending exit to pid={child.pid}")
-        await process.exit(child.pid, SUPERVISOR_SHUTDOWN)
-        pending_terminations[child_id] = reply_to
-    else:
-        print(f"[SUP TERMINATE_CHILD] child {child_id} already dead")
-        await process.send(reply_to, (True, f"Child {child_id} already dead"))
-
-
-async def _handle_get_child_status(children, child_id, reply_to):
-    print(f"[SUP GET_CHILD_STATUS] id={child_id}")
-    child = children.get(child_id)
-    if child:
-        status = {
-            "id": child_id,
-            "pid": child.pid,
-            "alive": process.is_alive(child.pid) if child.pid else False,
-            "restart_count": child.restart_count,
-            "type": child.spec.type,
-            "is_dynamic": child.is_dynamic,
-        }
-    else:
-        status = None
-    print(f"[SUP GET_CHILD_STATUS] status={status}")
-    await process.send(reply_to, status)
-
-
-async def _handle_list_children(children, reply_to):
-    print(f"[SUP LIST_CHILDREN] -> {list(children.keys())}")
-    await process.send(reply_to, list(children.keys()))
-
-
-async def _handle_which_children(children, reply_to):
-    infos = []
-    for cid, child in children.items():
-        infos.append(
-            {
-                "id": cid,
-                "pid": child.pid,
-                "type": child.spec.type,
-                "restart_count": child.restart_count,
-                "is_dynamic": child.is_dynamic,
-                "restart_type": str(child.spec.restart),
-                "modules": child.spec.modules,
-            }
-        )
-    print(f"[SUP WHICH_CHILDREN] infos={infos}")
-    await process.send(reply_to, infos)
-
-
-async def _handle_count_children(children, reply_to):
-    counts = {
-        "specs": len(children),
-        "active": sum(1 for c in children.values() if c.pid and process.is_alive(c.pid)),
-        "supervisors": sum(1 for c in children.values() if c.spec.type == "supervisor"),
-        "workers": sum(1 for c in children.values() if c.spec.type == "worker"),
-        "dynamic": sum(1 for c in children.values() if c.is_dynamic),
-        "static": sum(1 for c in children.values() if not c.is_dynamic),
-    }
-    print(f"[SUP COUNT_CHILDREN] counts={counts}")
-    await process.send(reply_to, counts)
-
-
-async def _add_child(children: Dict[str, _ChildState], dynamic_children: List[str], child_spec_obj: child_spec) -> Tuple[bool, str]:
-    if child_spec_obj.id in children:
-        return False, f"Child {child_spec_obj.id} already exists"
-    child_state = _ChildState(spec=child_spec_obj, is_dynamic=True)
-    children[child_spec_obj.id] = child_state
-    dynamic_children.append(child_spec_obj.id)
-    try:
-        await _start_child(child_state)
-        return True, f"Child {child_spec_obj.id} started successfully"
-    except Exception as e:
-        children.pop(child_spec_obj.id, None)
-        if child_spec_obj.id in dynamic_children:
-            dynamic_children.remove(child_spec_obj.id)
-        return False, f"Failed to start child: {e}"
+def _validate_child_spec(spec: child_spec):
+    """Validate that a child spec is correct."""
+    if not isinstance(spec, child_spec):
+        raise ModuleError(f"Expected module_child_spec, got {type(spec)}")
+    
+    if not is_otp_module(spec.module):
+        raise ModuleError(f"Child module {spec.module.__name__} is not an OTPModule")
 
 
 async def _start_child(child: _ChildState):
-    """
-    Start a child process and monitor it.
-    - If spec.name is given: supervisor registers it automatically.
-    - If no name: expect the child function to return a PID string.
-    """
-    if child.spec.name:
-        # Named child: supervisor owns registration
-        pid, monitor_ref = await process.spawn_monitor(
-            child.spec.func,
-            args=child.spec.args,
-            kwargs=child.spec.kwargs,
-            name=child.spec.name,
-            mailbox=True,
+    """Start a child process from its module_child_spec."""
+    spec = child.spec
+    module_class = spec.module
+    behavior = get_behavior(module_class)
+    
+    # Import here to avoid circular dependency
+    from otpylib import gen_server
+    from otpylib import supervisor
+    
+    # Start based on behavior
+    if behavior.name == 'gen_server':
+        pid = await gen_server.start_link(
+            module_class,
+            init_arg=spec.args,
+            name=spec.name
+        )
+    elif behavior.name == 'supervisor':
+        pid = await supervisor.start_link(
+            module_class,
+            init_arg=spec.args,
+            name=spec.name
         )
     else:
-        # Anonymous: run func, expect it to spawn and return a PID
-        result_pid = await child.spec.func(*child.spec.args, **child.spec.kwargs)
-        if not isinstance(result_pid, str):
-            raise RuntimeError(
-                f"Child function {child.spec.func.__name__} must return a PID string "
-                f"when no name is given, got {type(result_pid).__name__}"
-            )
-        pid = result_pid
-        monitor_ref = await process.monitor(pid)
-
+        raise RuntimeError(f"Unsupported child behavior: {behavior.name}")
+    
+    # Monitor the child
+    monitor_ref = await process.monitor(pid)
+    
     child.pid = pid
     child.monitor_ref = monitor_ref
     child.last_successful_start = time.time()
+
+
+async def _shutdown_children(children: Dict[str, _ChildState]):
+    """Shutdown all children on supervisor termination."""
+    for child in children.values():
+        if child.pid and process.is_alive(child.pid):
+            try:
+                await process.exit(child.pid, SUPERVISOR_SHUTDOWN)
+            except Exception:
+                pass
+
+
+# ============================================================================
+# Message Handlers
+# ============================================================================
+
+async def _handle_down(
+    children: Dict[str, _ChildState],
+    ref: str,
+    pid: str,
+    reason: Any,
+    opts: options,
+    start_order: List[str],
+    dynamic_children: List[str],
+    pending_terminations: Dict[str, str]
+) -> bool:
+    """Handle a DOWN message from a monitored child."""
+    # Find the child
+    child_id = next((cid for cid, c in children.items() if c.monitor_ref == ref), None)
+    
+    if not child_id:
+        return False
+    
+    # Check if this was a pending termination FIRST (before handling exit)
+    if child_id in pending_terminations:
+        reply_to = pending_terminations.pop(child_id)
+        await process.send(reply_to, (True, f"Child {child_id} terminated"))
+    
+    # Handle the child exit
+    try:
+        await _handle_child_exit(
+            children, child_id, reason, opts,
+            start_order, dynamic_children
+        )
+    except RuntimeError as e:
+        # Restart intensity exceeded - shutdown supervisor
+        print(f"[dynamic_supervisor] Restart intensity exceeded: {e}")
+        return True
+    
+    return False
 
 
 async def _handle_child_exit(
@@ -378,20 +375,42 @@ async def _handle_child_exit(
     reason: Any,
     opts: options,
     start_order: List[str],
-    dynamic_children: List[str],
+    dynamic_children: List[str]
 ):
+    """Handle a child exit and apply restart strategy."""
     child = children[child_id]
-    failed = reason not in [NORMAL, SUPERVISOR_SHUTDOWN] and reason != KILLED
-
-    # Clean up registry if child had a global name
+    
+    # Unregister name if child had one
     if child.spec.name:
         try:
             await process.unregister(child.spec.name)
         except Exception:
             pass
-
-    if reason in [SHUTDOWN, SUPERVISOR_SHUTDOWN]:
-        # Remove dynamic children fully
+    
+    # Check if this is a normal shutdown
+    if reason in [SHUTDOWN, SUPERVISOR_SHUTDOWN, KILLED]:
+        if child.is_dynamic:
+            # Remove dynamic children completely
+            children.pop(child_id, None)
+            if child_id in dynamic_children:
+                dynamic_children.remove(child_id)
+        else:
+            # Mark static children as down
+            child.pid = None
+            child.monitor_ref = None
+        return
+    
+    # Determine if we should restart
+    failed = reason != NORMAL
+    should_restart = True
+    
+    if child.spec.restart == TRANSIENT and not failed:
+        should_restart = False
+    elif child.spec.restart == TEMPORARY:
+        should_restart = False
+    
+    if not should_restart:
+        # No restart - remove if dynamic, mark down if static
         if child.is_dynamic:
             children.pop(child_id, None)
             if child_id in dynamic_children:
@@ -400,104 +419,177 @@ async def _handle_child_exit(
             child.pid = None
             child.monitor_ref = None
         return
-
-    # Decide restart policy
-    should_restart = True
-    if child.spec.restart == TRANSIENT and not failed:
-        should_restart = False
-    elif child.spec.restart == TEMPORARY:
-        should_restart = False
-
-    if should_restart:
-        current_time = time.time()
-        child.failure_times.append(current_time)
-        cutoff = current_time - opts.max_seconds
-        while child.failure_times and child.failure_times[0] < cutoff:
-            child.failure_times.popleft()
-        if len(child.failure_times) > opts.max_restarts:
-            raise RuntimeError(f"Restart limit exceeded for child {child_id}")
-
-        # Restart strategies
-        if opts.strategy == ONE_FOR_ALL:
-            for cid, other in children.items():
-                if cid != child_id and other.pid and process.is_alive(other.pid):
-                    await process.exit(other.pid, KILLED)
-            all_children = start_order + dynamic_children
-            for cid in all_children:
+    
+    # Check restart intensity
+    current_time = time.time()
+    child.failure_times.append(current_time)
+    cutoff = current_time - opts.max_seconds
+    
+    while child.failure_times and child.failure_times[0] < cutoff:
+        child.failure_times.popleft()
+    
+    if len(child.failure_times) > opts.max_restarts:
+        raise RuntimeError(f"Restart intensity exceeded for child {child_id}")
+    
+    # Apply restart strategy
+    if opts.strategy == ONE_FOR_ONE:
+        child.restart_count += 1
+        await _start_child(child)
+    
+    elif opts.strategy == ONE_FOR_ALL:
+        # Kill all other children
+        for cid, other in children.items():
+            if cid != child_id and other.pid and process.is_alive(other.pid):
+                await process.exit(other.pid, KILLED)
+        
+        # Restart all children
+        all_children = start_order + dynamic_children
+        for cid in all_children:
+            if cid in children:
+                restart_child = children[cid]
+                restart_child.restart_count += 1
+                await _start_child(restart_child)
+    
+    elif opts.strategy == REST_FOR_ONE:
+        # Find position and restart this child and all later ones
+        all_children = start_order + dynamic_children
+        try:
+            idx = all_children.index(child_id)
+            
+            # Kill later children
+            for cid in all_children[idx + 1:]:
+                if cid in children:
+                    other = children[cid]
+                    if other.pid and process.is_alive(other.pid):
+                        await process.exit(other.pid, KILLED)
+            
+            # Restart this and later children
+            for cid in all_children[idx:]:
                 if cid in children:
                     restart_child = children[cid]
                     restart_child.restart_count += 1
                     await _start_child(restart_child)
-
-        elif opts.strategy == REST_FOR_ONE:
-            all_children = start_order + dynamic_children
-            try:
-                idx = all_children.index(child_id)
-                # Kill later siblings
-                for cid in all_children[idx + 1:]:
-                    if cid in children:
-                        other_child = children[cid]
-                        if other_child.pid and process.is_alive(other_child.pid):
-                            await process.exit(other_child.pid, KILLED)
-                # Restart this and later
-                for cid in all_children[idx:]:
-                    if cid in children:
-                        restart_child = children[cid]
-                        restart_child.restart_count += 1
-                        await _start_child(restart_child)
-            except ValueError:
-                child.restart_count += 1
-                await _start_child(child)
-        else:
+        except ValueError:
+            # Child not in list, just restart it
             child.restart_count += 1
             await _start_child(child)
+
+
+async def _handle_add_child(
+    children: Dict[str, _ChildState],
+    dynamic_children: List[str],
+    spec: child_spec,
+    reply_to: str
+):
+    """Handle request to add a dynamic child."""
+    try:
+        _validate_child_spec(spec)
+        
+        if spec.id in children:
+            await process.send(reply_to, (False, f"Child {spec.id} already exists"))
+            return
+        
+        # Create and start child
+        child_state = _ChildState(spec=spec, is_dynamic=True)
+        children[spec.id] = child_state
+        dynamic_children.append(spec.id)
+        
+        await _start_child(child_state)
+        await process.send(reply_to, (True, f"Child {spec.id} started successfully"))
+    
+    except Exception as e:
+        # Cleanup on failure
+        children.pop(spec.id, None)
+        if spec.id in dynamic_children:
+            dynamic_children.remove(spec.id)
+        await process.send(reply_to, (False, f"Failed to start child: {e}"))
+
+
+async def _handle_terminate_child(
+    children: Dict[str, _ChildState],
+    child_id: str,
+    reply_to: str,
+    pending_terminations: Dict[str, str]
+):
+    """Handle request to terminate a dynamic child."""
+    child = children.get(child_id)
+    
+    if not child:
+        await process.send(reply_to, (False, f"Child {child_id} not found"))
+        return
+    
+    if not child.is_dynamic:
+        await process.send(reply_to, (False, f"Cannot terminate static child {child_id}"))
+        return
+    
+    if child.pid and process.is_alive(child.pid):
+        # Send exit signal and wait for DOWN message
+        await process.exit(child.pid, SUPERVISOR_SHUTDOWN)
+        pending_terminations[child_id] = reply_to
     else:
-        # No restart: purge if dynamic, clear if static
-        if child.is_dynamic:
-            children.pop(child_id, None)
-            if child_id in dynamic_children:
-                dynamic_children.remove(child_id)
-        else:
-            child.pid = None
-            child.monitor_ref = None
+        await process.send(reply_to, (True, f"Child {child_id} already terminated"))
 
 
-async def start_child(sup_pid: str, spec: child_spec):
-    print(f"[API start_child] sending add_child for {spec.id} to {sup_pid}")
-    await process.send(sup_pid, (ADD_CHILD, spec, process.self()))
-    result = await process.receive(timeout=5.0)
-    print(f"[API start_child] got reply {result}")
-    return result
+async def _handle_get_child_status(
+    children: Dict[str, _ChildState],
+    child_id: str,
+    reply_to: str
+):
+    """Handle request for child status."""
+    child = children.get(child_id)
+    
+    if child:
+        status = {
+            "id": child_id,
+            "pid": child.pid,
+            "alive": process.is_alive(child.pid) if child.pid else False,
+            "restart_count": child.restart_count,
+            "is_dynamic": child.is_dynamic,
+            "module": child.spec.module.__mod_id__,
+        }
+    else:
+        status = None
+    
+    await process.send(reply_to, status)
 
 
-async def terminate_child(sup_pid: str, child_id: str):
-    print(f"[API terminate_child] sending terminate_child for {child_id} to {sup_pid}")
-    await process.send(sup_pid, (TERMINATE_CHILD, child_id, process.self()))
-    result = await process.receive(timeout=5.0)
-    print(f"[API terminate_child] got reply {result}")
-    return result
+async def _handle_list_children(
+    children: Dict[str, _ChildState],
+    reply_to: str
+):
+    """Handle request to list all child IDs."""
+    await process.send(reply_to, list(children.keys()))
 
 
-async def list_children(supervisor_pid: str) -> List[str]:
-    """
-    Get a list of child IDs under the supervisor.
-    """
-    await process.send(supervisor_pid, (LIST_CHILDREN, process.self()))
-    return await process.receive(timeout=5.0)
+async def _handle_which_children(
+    children: Dict[str, _ChildState],
+    reply_to: str
+):
+    """Handle request for detailed child information."""
+    infos = []
+    for child_id, child in children.items():
+        infos.append({
+            "id": child_id,
+            "pid": child.pid,
+            "module": child.spec.module.__mod_id__,
+            "restart_count": child.restart_count,
+            "is_dynamic": child.is_dynamic,
+            "restart_type": str(child.spec.restart),
+        })
+    
+    await process.send(reply_to, infos)
 
 
-async def which_children(supervisor_pid: str) -> List[Dict[str, Any]]:
-    """
-    Get detailed info for each child (id, pid, type, restart_count, etc.).
-    """
-    await process.send(supervisor_pid, (WHICH_CHILDREN, process.self()))
-    return await process.receive(timeout=5.0)
-
-
-async def count_children(supervisor_pid: str) -> Dict[str, int]:
-    """
-    Return counts of specs, active processes, supervisors, workers,
-    dynamic vs static.
-    """
-    await process.send(supervisor_pid, (COUNT_CHILDREN, process.self()))
-    return await process.receive(timeout=5.0)
+async def _handle_count_children(
+    children: Dict[str, _ChildState],
+    reply_to: str
+):
+    """Handle request for child counts."""
+    counts = {
+        "specs": len(children),
+        "active": sum(1 for c in children.values() if c.pid and process.is_alive(c.pid)),
+        "dynamic": sum(1 for c in children.values() if c.is_dynamic),
+        "static": sum(1 for c in children.values() if not c.is_dynamic),
+    }
+    
+    await process.send(reply_to, counts)

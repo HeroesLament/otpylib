@@ -44,7 +44,8 @@ async def spawn_link(
     args: Optional[List[Any]] = None,
     kwargs: Optional[Dict[str, Any]] = None,
     name: Optional[str] = None,
-    mailbox: bool = True
+    mailbox: bool = True,
+    trap_exits: bool = False
 ) -> str:
     """
     Spawn a process and link it to the current process.
@@ -64,7 +65,7 @@ async def spawn_link(
     
     return await runtime.spawn_link(
         func, args=args, kwargs=kwargs,
-        name=name, mailbox=mailbox
+        name=name, mailbox=mailbox, trap_exits=trap_exits
     )
 
 
@@ -170,6 +171,20 @@ def whereis(name: str) -> Optional[str]:
         return None
     
     return runtime.whereis(name)
+
+
+def whereis_name(name: str) -> Optional[str]:
+    """
+    Look up the registered name of a PID.
+    
+    :param pid: The PID to be queried
+    :returns: Name if found, None otherwise
+    """
+    runtime = get_runtime()
+    if not runtime:
+        return None
+    
+    return runtime.whereis_name()
 
 
 def self() -> Optional[str]:

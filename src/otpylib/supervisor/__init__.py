@@ -1,17 +1,12 @@
 """
-Supervisor module for OTPyLib.
-
-Provides process supervision with restart strategies.
+Supervisorm module for OTPyLib - Module-aware supervisor.
 """
 
 from otpylib.supervisor.core import (
-    start,
     start_link,
-    get_child_status,
-    list_children,
     child_spec,
     options,
-    SupervisorHandle
+    NotASupervisorError,
 )
 
 from otpylib.supervisor.atoms import (
@@ -26,24 +21,21 @@ from otpylib.supervisor.atoms import (
     REST_FOR_ONE,
     
     # Exit reasons
-    NORMAL,
     SHUTDOWN,
-    KILLED,
     SUPERVISOR_SHUTDOWN,
-    SIBLING_RESTART_LIMIT
+    KILLED,
 )
 
 __all__ = [
     # Functions
-    'start',
     'start_link',
-    'get_child_status',
-    'list_children',
     
     # Classes
     'child_spec',
     'options',
-    'SupervisorHandle',
+    
+    # Exceptions
+    'NotASupervisorError',
     
     # Atoms - Restart strategies
     'PERMANENT',
@@ -56,9 +48,7 @@ __all__ = [
     'REST_FOR_ONE',
     
     # Atoms - Exit reasons
-    'NORMAL',
     'SHUTDOWN',
-    'KILLED',
     'SUPERVISOR_SHUTDOWN',
-    'SIBLING_RESTART_LIMIT'
+    'KILLED',
 ]

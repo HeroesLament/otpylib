@@ -35,6 +35,7 @@ TERMINATED = atom.ensure("terminated")
 
 NORMAL = atom.ensure("normal")
 SHUTDOWN = atom.ensure("shutdown")
+SUPERVISOR_SHUTDOWN = atom.ensure("supervisor_shutdown")
 KILLED = atom.ensure("killed")
 ABNORMAL = atom.ensure("abnormal")
 NOPROC = atom.ensure("noproc")

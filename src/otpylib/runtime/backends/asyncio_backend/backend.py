@@ -49,6 +49,9 @@ class AsyncIOBackend(RuntimeBackend):
         # Monitor tracking
         self._monitors: Dict[str, MonitorRef] = {}  # ref -> MonitorRef
 
+        # Timer tracking
+        self._timers: Dict[str, Tuple[asyncio.Task, float]] = {}
+
         # Statistics
         self._stats = {
             "total_spawned": 0,
@@ -337,6 +340,60 @@ class AsyncIOBackend(RuntimeBackend):
 
         await process.mailbox.send(message)
         self._stats["messages_sent"] += 1
+
+    async def send_after(self, delay: float, target: str, message: Any) -> str:
+        """Send message after delay. Returns timer ref for cancellation."""
+        ref = f"timer_{uuid.uuid4().hex[:12]}"
+        
+        async def delayed_send():
+            try:
+                await asyncio.sleep(delay)
+                await self.send(target, message)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self._timers.pop(ref, None)
+        
+        task = asyncio.create_task(delayed_send())
+        end_time = time.time() + delay
+        self._timers[ref] = (task, end_time)
+        
+        await self.send(LOGGER, ("log", "DEBUG", f"[send_after] ref={ref} delay={delay}s target={target}",
+                                {"ref": ref, "delay": delay, "target": target}))
+        return ref
+    
+    async def cancel_timer(self, ref: str) -> Optional[float]:
+        """Cancel timer. Returns remaining seconds or None if already fired."""
+        timer_info = self._timers.pop(ref, None)
+        if not timer_info:
+            return None
+        
+        task, end_time = timer_info
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            
+            remaining = max(0, end_time - time.time())
+            await self.send(LOGGER, ("log", "DEBUG", f"[cancel_timer] ref={ref} remaining={remaining:.2f}s",
+                                    {"ref": ref, "remaining": remaining}))
+            return remaining
+        
+        return None
+    
+    def read_timer(self, ref: str) -> Optional[float]:
+        """Check timer without cancelling. Returns remaining seconds or None."""
+        timer_info = self._timers.get(ref)
+        if not timer_info:
+            return None
+        
+        task, end_time = timer_info
+        if task.done():
+            return None
+        
+        return max(0, end_time - time.time())
 
     async def receive(self, timeout: Optional[float] = None,
                       match: Optional[Callable[[Any], bool]] = None) -> Any:

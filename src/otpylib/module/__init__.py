@@ -23,6 +23,7 @@ from .core import (
 from .atoms import (
     GEN_SERVER,
     SUPERVISOR,
+    DYNAMIC_SUPERVISOR,
     APPLICATION,
     GEN_STATEM,
     GEN_EVENT,
@@ -84,6 +85,7 @@ __all__ = [
     # Behavior atoms
     'GEN_SERVER',
     'SUPERVISOR',
+    'DYNAMIC_SUPERVISOR',
     'APPLICATION',
     'GEN_STATEM',
     'GEN_EVENT',

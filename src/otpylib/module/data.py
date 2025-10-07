@@ -12,7 +12,7 @@ from datetime import datetime
 
 from otpylib.atom import Atom
 from .atoms import (
-    GEN_SERVER, SUPERVISOR, APPLICATION, GEN_STATEM, GEN_EVENT, TASK,
+    GEN_SERVER, SUPERVISOR, DYNAMIC_SUPERVISOR, APPLICATION, GEN_STATEM, GEN_EVENT, TASK,
     INIT, TERMINATE, CODE_CHANGE,
     HANDLE_CALL, HANDLE_CAST, HANDLE_INFO,
     HANDLE_CHILD_EXIT,
@@ -442,6 +442,15 @@ BEHAVIOR_CONTRACTS: Dict[Atom, BehaviorContract] = {
         optional_callbacks=['handle_child_exit']
     ),
     
+    DYNAMIC_SUPERVISOR: BehaviorContract(
+        behavior=DYNAMIC_SUPERVISOR,
+        required_callbacks=[
+            'init',
+            'terminate'
+        ],
+        optional_callbacks=[]
+    ),
+    
     APPLICATION: BehaviorContract(
         behavior=APPLICATION,
         required_callbacks=[
@@ -492,25 +501,25 @@ CALLBACK_SIGNATURES: Dict[Atom, Dict[str, CallbackSignature]] = {
             name='init',
             arity=2,  # self, args
             param_names=['self', 'args'],
-            returns="{'ok': state} | {'stop': reason}"
+            returns="state"
         ),
         'handle_call': CallbackSignature(
             name='handle_call',
             arity=4,  # self, request, from_pid, state
             param_names=['self', 'request', 'from_pid', 'state'],
-            returns="{'reply': reply, 'state': state} | {'noreply': state} | {'stop': reason, 'state': state}"
+            returns="(Reply | NoReply | Stop, state)"
         ),
         'handle_cast': CallbackSignature(
             name='handle_cast',
             arity=3,  # self, message, state
             param_names=['self', 'message', 'state'],
-            returns="{'noreply': state} | {'stop': reason, 'state': state}"
+            returns="(NoReply | Stop, state)"
         ),
         'handle_info': CallbackSignature(
             name='handle_info',
             arity=3,  # self, message, state
             param_names=['self', 'message', 'state'],
-            returns="{'noreply': state} | {'stop': reason, 'state': state}"
+            returns="(NoReply | Stop, state)"
         ),
         'terminate': CallbackSignature(
             name='terminate',
@@ -525,7 +534,22 @@ CALLBACK_SIGNATURES: Dict[Atom, Dict[str, CallbackSignature]] = {
             name='init',
             arity=2,  # self, args
             param_names=['self', 'args'],
-            returns="{'ok': supervisor_spec}"
+            returns="(children: List[child_spec], opts: options)"
+        ),
+        'terminate': CallbackSignature(
+            name='terminate',
+            arity=3,  # self, reason, state
+            param_names=['self', 'reason', 'state'],
+            returns="None"
+        )
+    },
+    
+    DYNAMIC_SUPERVISOR: {
+        'init': CallbackSignature(
+            name='init',
+            arity=2,  # self, args
+            param_names=['self', 'args'],
+            returns="(children: List[child_spec], opts: options)"
         ),
         'terminate': CallbackSignature(
             name='terminate',
@@ -540,7 +564,7 @@ CALLBACK_SIGNATURES: Dict[Atom, Dict[str, CallbackSignature]] = {
             name='start',
             arity=3,  # self, start_type, args
             param_names=['self', 'start_type', 'args'],
-            returns="{'ok': pid}"
+            returns="pid"
         ),
         'stop': CallbackSignature(
             name='stop',

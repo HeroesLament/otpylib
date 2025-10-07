@@ -26,6 +26,7 @@ from otpylib.atom import ensure
 
 GEN_SERVER          = ensure("gen_server")
 SUPERVISOR          = ensure("supervisor")
+DYNAMIC_SUPERVISOR  = ensure("dynamic_supervisor")
 APPLICATION         = ensure("application")
 GEN_STATEM          = ensure("gen_statem")
 GEN_EVENT           = ensure("gen_event")

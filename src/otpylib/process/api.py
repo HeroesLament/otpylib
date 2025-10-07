@@ -112,7 +112,7 @@ async def send(target: str, message: Any) -> None:
     await runtime.send(target, message)
 
 
-async def send_after(target: str, message: Any) -> None:
+async def send_after(delay: float, target: str, message: Any) -> None:
     """
     Send a message to a process.
     
@@ -123,7 +123,7 @@ async def send_after(target: str, message: Any) -> None:
     if not runtime:
         raise RuntimeError("No runtime backend configured")
     
-    await runtime.send_after(target, message)
+    await runtime.send_after(delay, target, message)
 
 
 async def read_timer(ref: str) -> Optional[float]:

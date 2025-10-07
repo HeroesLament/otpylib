@@ -395,18 +395,6 @@ class AsyncIOBackend(RuntimeBackend):
         
         return None
 
-    def read_timer(self, ref: str) -> Optional[float]:
-        """Check timer without cancelling. Returns remaining seconds or None."""
-        timer_info = self._timers.get(ref)
-        if not timer_info:
-            return None
-        
-        task, end_time = timer_info
-        if task.done():
-            return None
-        
-        return max(0, end_time - time.time())
-
     async def receive(self, timeout: Optional[float] = None,
                       match: Optional[Callable[[Any], bool]] = None) -> Any:
         """Receive a message from the current process's mailbox."""

@@ -1,25 +1,61 @@
 """
 Test gen_server info message handling.
 """
-import types
 import asyncio
 import pytest
 from otpylib import gen_server, process
+from otpylib.module import OTPModule, GEN_SERVER
+from otpylib.gen_server.data import NoReply, Stop, Reply
+
+
+class InfoHandlerServer(metaclass=OTPModule, behavior=GEN_SERVER, version="1.0.0"):
+    """Gen server that handles info messages."""
+    
+    async def init(self, test_state):
+        self.test_state = test_state
+        return test_state
+    
+    async def handle_call(self, request, from_pid, state):
+        return (Reply('ok'), state)
+    
+    async def handle_cast(self, message, state):
+        return (NoReply(), state)
+    
+    async def handle_info(self, msg, state):
+        self.test_state.messages.append(msg)
+        return (NoReply(), state)
+    
+    async def terminate(self, reason, state):
+        pass
+
+
+class StopOnInfoServer(metaclass=OTPModule, behavior=GEN_SERVER, version="1.0.0"):
+    """Gen server that stops on specific info message."""
+    
+    async def init(self, test_state):
+        self.test_state = test_state
+        return test_state
+    
+    async def handle_call(self, request, from_pid, state):
+        return (Reply('ok'), state)
+    
+    async def handle_cast(self, message, state):
+        return (NoReply(), state)
+    
+    async def handle_info(self, msg, state):
+        if msg == "stop":
+            return (Stop("stopped"), state)
+        return (NoReply(), state)
+    
+    async def terminate(self, reason, state):
+        pass
 
 
 @pytest.mark.asyncio
 async def test_handle_info(test_state):
     """Test that info messages are handled."""
     async def tester():
-        async def init(state):
-            return state
-        
-        async def handle_info(msg, state):
-            state.messages.append(msg)
-            return gen_server.NoReply(), state
-        
-        mod = types.SimpleNamespace(__name__="test_mod", init=init, handle_info=handle_info)
-        pid = await gen_server.start(mod, test_state)
+        pid = await gen_server.start(InfoHandlerServer, init_arg=test_state)
         
         await process.send(pid, "info1")
         await process.send(pid, ("tuple", "info"))
@@ -40,16 +76,7 @@ async def test_handle_info(test_state):
 async def test_info_with_stop(test_state):
     """Test that info handler can trigger Stop."""
     async def tester():
-        async def init(state):
-            return state
-        
-        async def handle_info(msg, state):
-            if msg == "stop":
-                return gen_server.Stop("stopped"), state
-            return gen_server.NoReply(), state
-        
-        mod = types.SimpleNamespace(__name__="test_mod", init=init, handle_info=handle_info)
-        pid = await gen_server.start(mod, test_state)
+        pid = await gen_server.start(StopOnInfoServer, init_arg=test_state)
         
         await process.send(pid, "stop")
         

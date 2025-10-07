@@ -1,30 +1,89 @@
 """
 Test gen_server call/reply behavior.
 """
-import types
 import asyncio
 import pytest
 from otpylib import gen_server, process
+from otpylib.module import OTPModule, GEN_SERVER
+from otpylib.gen_server.data import NoReply, Stop, Reply
+
+
+class KeyValueServer(metaclass=OTPModule, behavior=GEN_SERVER, version="1.0.0"):
+    """Gen server that stores key-value pairs."""
+    
+    async def init(self, test_state):
+        self.test_state = test_state
+        return test_state
+    
+    async def handle_call(self, msg, from_pid, state):
+        if msg == "get":
+            return (Reply(self.test_state.data), state)
+        elif isinstance(msg, tuple) and msg[0] == "set":
+            key, val = msg[1], msg[2]
+            self.test_state.data[key] = val
+            return (Reply("ok"), state)
+        return (Reply("unknown"), state)
+    
+    async def handle_cast(self, message, state):
+        return (NoReply(), state)
+    
+    async def handle_info(self, message, state):
+        return (NoReply(), state)
+    
+    async def terminate(self, reason, state):
+        pass
+
+
+class StopOnCallServer(metaclass=OTPModule, behavior=GEN_SERVER, version="1.0.0"):
+    """Gen server that stops on specific call."""
+    
+    async def init(self, test_state):
+        self.test_state = test_state
+        return test_state
+    
+    async def handle_call(self, msg, from_pid, state):
+        if msg == "stop":
+            return (Stop("stopped"), state)
+        return (Reply("ok"), state)
+    
+    async def handle_cast(self, message, state):
+        return (NoReply(), state)
+    
+    async def handle_info(self, message, state):
+        return (NoReply(), state)
+    
+    async def terminate(self, reason, state):
+        pass
+
+
+class CounterCallServer(metaclass=OTPModule, behavior=GEN_SERVER, version="1.0.0"):
+    """Gen server with counter modified via calls."""
+    
+    async def init(self, test_state):
+        self.test_state = test_state
+        return test_state
+    
+    async def handle_call(self, msg, from_pid, state):
+        if msg == "increment":
+            self.test_state.counter += 1
+            return (Reply(self.test_state.counter), state)
+        return (Reply("unknown"), state)
+    
+    async def handle_cast(self, message, state):
+        return (NoReply(), state)
+    
+    async def handle_info(self, message, state):
+        return (NoReply(), state)
+    
+    async def terminate(self, reason, state):
+        pass
 
 
 @pytest.mark.asyncio
 async def test_simple_call(test_state):
     """Test basic call/reply pattern."""
     async def tester():
-        async def init(state):
-            return state
-        
-        async def handle_call(msg, caller, state):
-            if msg == "get":
-                return gen_server.Reply(state.data), state
-            elif isinstance(msg, tuple) and msg[0] == "set":
-                key, val = msg[1], msg[2]
-                state.data[key] = val
-                return gen_server.Reply("ok"), state
-            return gen_server.Reply("unknown"), state
-        
-        mod = types.SimpleNamespace(init=init, handle_call=handle_call)
-        pid = await gen_server.start(mod, test_state)
+        pid = await gen_server.start(KeyValueServer, init_arg=test_state)
         
         result = await gen_server.call(pid, "get")
         assert result == {}
@@ -45,16 +104,7 @@ async def test_simple_call(test_state):
 async def test_call_with_stop(test_state):
     """Test that Stop action terminates the server."""
     async def tester():
-        async def init(state):
-            return state
-        
-        async def handle_call(msg, caller, state):
-            if msg == "stop":
-                return gen_server.Stop("stopped"), state
-            return gen_server.Reply("ok"), state
-        
-        mod = types.SimpleNamespace(init=init, handle_call=handle_call)
-        pid = await gen_server.start(mod, test_state)
+        pid = await gen_server.start(StopOnCallServer, init_arg=test_state)
         
         from otpylib.gen_server.core import GenServerExited
         try:
@@ -75,17 +125,7 @@ async def test_call_with_stop(test_state):
 async def test_call_modifies_state(test_state):
     """Test that call handlers can modify state."""
     async def tester():
-        async def init(state):
-            return state
-        
-        async def handle_call(msg, caller, state):
-            if msg == "increment":
-                state.counter += 1
-                return gen_server.Reply(state.counter), state
-            return gen_server.Reply("unknown"), state
-        
-        mod = types.SimpleNamespace(init=init, handle_call=handle_call)
-        pid = await gen_server.start(mod, test_state)
+        pid = await gen_server.start(CounterCallServer, init_arg=test_state)
         
         result1 = await gen_server.call(pid, "increment")
         assert result1 == 1

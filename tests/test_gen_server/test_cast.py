@@ -1,25 +1,85 @@
 """
 Test gen_server cast (fire-and-forget) behavior.
 """
-import types
 import asyncio
 import pytest
 from otpylib import gen_server, process
+from otpylib.module import OTPModule, GEN_SERVER
+from otpylib.gen_server.data import NoReply, Stop, Reply
+
+
+class EventCollectorServer(metaclass=OTPModule, behavior=GEN_SERVER, version="1.0.0"):
+    """Gen server that collects cast events."""
+    
+    async def init(self, test_state):
+        self.test_state = test_state
+        return test_state
+    
+    async def handle_call(self, request, from_pid, state):
+        return (Reply('ok'), state)
+    
+    async def handle_cast(self, msg, state):
+        self.test_state.events.append(msg)
+        return (NoReply(), state)
+    
+    async def handle_info(self, message, state):
+        return (NoReply(), state)
+    
+    async def terminate(self, reason, state):
+        pass
+
+
+class StopOnCastServer(metaclass=OTPModule, behavior=GEN_SERVER, version="1.0.0"):
+    """Gen server that stops on specific cast message."""
+    
+    async def init(self, test_state):
+        self.test_state = test_state
+        return test_state
+    
+    async def handle_call(self, request, from_pid, state):
+        return (Reply('ok'), state)
+    
+    async def handle_cast(self, msg, state):
+        if msg == "stop":
+            return (Stop("stopped"), state)
+        return (NoReply(), state)
+    
+    async def handle_info(self, message, state):
+        return (NoReply(), state)
+    
+    async def terminate(self, reason, state):
+        pass
+
+
+class CounterServer(metaclass=OTPModule, behavior=GEN_SERVER, version="1.0.0"):
+    """Gen server with counter that can be modified via cast."""
+    
+    async def init(self, test_state):
+        self.test_state = test_state
+        return test_state
+    
+    async def handle_call(self, msg, from_pid, state):
+        if msg == "get":
+            return (Reply(self.test_state.counter), state)
+        return (Reply("unknown"), state)
+    
+    async def handle_cast(self, msg, state):
+        if msg == "increment":
+            self.test_state.counter += 1
+        return (NoReply(), state)
+    
+    async def handle_info(self, message, state):
+        return (NoReply(), state)
+    
+    async def terminate(self, reason, state):
+        pass
 
 
 @pytest.mark.asyncio
 async def test_simple_cast(test_state):
     """Test basic cast pattern."""
     async def tester():
-        async def init(state):
-            return state
-        
-        async def handle_cast(msg, state):
-            state.events.append(msg)
-            return gen_server.NoReply(), state
-        
-        mod = types.SimpleNamespace(init=init, handle_cast=handle_cast)
-        pid = await gen_server.start(mod, test_state)
+        pid = await gen_server.start(EventCollectorServer, init_arg=test_state)
         
         await gen_server.cast(pid, "event1")
         await gen_server.cast(pid, "event2")
@@ -40,16 +100,7 @@ async def test_simple_cast(test_state):
 async def test_cast_with_stop(test_state):
     """Test that cast can trigger Stop."""
     async def tester():
-        async def init(state):
-            return state
-        
-        async def handle_cast(msg, state):
-            if msg == "stop":
-                return gen_server.Stop("stopped"), state
-            return gen_server.NoReply(), state
-        
-        mod = types.SimpleNamespace(init=init, handle_cast=handle_cast)
-        pid = await gen_server.start(mod, test_state)
+        pid = await gen_server.start(StopOnCastServer, init_arg=test_state)
         
         await gen_server.cast(pid, "stop")
         
@@ -65,25 +116,7 @@ async def test_cast_with_stop(test_state):
 async def test_cast_modifies_state(test_state):
     """Test that cast can modify server state."""
     async def tester():
-        async def init(state):
-            return state
-        
-        async def handle_call(msg, caller, state):
-            if msg == "get":
-                return gen_server.Reply(state.counter), state
-            return gen_server.Reply("unknown"), state
-        
-        async def handle_cast(msg, state):
-            if msg == "increment":
-                state.counter += 1
-            return gen_server.NoReply(), state
-        
-        mod = types.SimpleNamespace(
-            init=init, 
-            handle_call=handle_call,
-            handle_cast=handle_cast
-        )
-        pid = await gen_server.start(mod, test_state)
+        pid = await gen_server.start(CounterServer, init_arg=test_state)
         
         await gen_server.cast(pid, "increment")
         await gen_server.cast(pid, "increment")

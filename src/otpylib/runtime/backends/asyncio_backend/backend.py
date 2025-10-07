@@ -257,6 +257,22 @@ class AsyncIOBackend(RuntimeBackend):
         await self.send(LOGGER, ("log", "DEBUG", f"[link] {self_pid} <-> {target_pid}",
                                 {"self": self_pid, "target": target_pid}))
 
+    async def unlink(self, target_pid: str) -> None:
+        """Remove an existing link (symmetric, BEAM parity)."""
+        self_pid = self.self()
+        if not self_pid:
+            raise NotInProcessError("unlink() must be called from within a process")
+
+        target_pid = self._name_registry.get(target_pid, target_pid)
+
+        if self_pid in self._processes:
+            self._processes[self_pid].links.discard(target_pid)
+        if target_pid in self._processes:
+            self._processes[target_pid].links.discard(self_pid)
+
+        await self.send(LOGGER, ("log", "DEBUG", f"[unlink] {self_pid} -X- {target_pid}",
+                                {"self": self_pid, "target": target_pid}))
+
 
     async def monitor(self, target_pid: str) -> str:
         """Create a monitor (unidirectional). Returns the monitor ref."""

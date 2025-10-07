@@ -1,34 +1,59 @@
 # tests/test_dynamic_supervisor/test_integration.py
+"""
+Test dynamic supervisor integration scenarios.
+"""
 import pytest
 import asyncio
-
 from otpylib import process
+from otpylib.module import OTPModule, GEN_SERVER
+from otpylib.gen_server.data import Reply, NoReply
 from otpylib import dynamic_supervisor
 from otpylib.dynamic_supervisor import (
     child_spec,
     options,
-    DynamicSupervisorHandle,
     PERMANENT,
     TRANSIENT,
+    SHUTDOWN,
 )
 
 pytestmark = pytest.mark.asyncio
 
 
-async def worker_pool_manager():
-    """Example task that manages a worker pool."""
-    await asyncio.sleep(0.1)
+# ============================================================================
+# Test Worker Modules
+# ============================================================================
+
+class WorkerTaskModule(metaclass=OTPModule, behavior=GEN_SERVER, version="1.0.0"):
+    """Simple worker that completes quickly."""
+    
+    async def init(self, worker_id):
+        self.worker_id = worker_id
+        # Simulate quick work
+        await asyncio.sleep(0.05)
+        return {'worker_id': worker_id, 'result': f"worker-{worker_id}-done"}
+    
+    async def handle_call(self, request, from_pid, state):
+        if request == 'get_result':
+            return (Reply(state['result']), state)
+        return (Reply('ok'), state)
+    
+    async def handle_cast(self, message, state):
+        return (NoReply(), state)
+    
+    async def handle_info(self, message, state):
+        return (NoReply(), state)
+    
+    async def terminate(self, reason, state):
+        pass
 
 
-async def worker_task(worker_id: int):
-    """Example worker task."""
-    await asyncio.sleep(0.05)
-    return f"worker-{worker_id}-done"
+# ============================================================================
+# Tests
+# ============================================================================
 
-
-async def test_nested_supervisors(log_handler):
+async def test_nested_supervisors():
     """Test nested dynamic supervisors."""
-
+    
     async def body():
         # Start parent supervisor
         parent_pid = await dynamic_supervisor.start(
@@ -36,44 +61,50 @@ async def test_nested_supervisors(log_handler):
             options(),
             "parent_supervisor",
         )
-        parent_handle = DynamicSupervisorHandle(parent_pid)
-
+        
         # Start child supervisor
         child_pid = await dynamic_supervisor.start(
             [],
             options(),
             "child_supervisor",
         )
-        child_handle = DynamicSupervisorHandle(child_pid)
-
+        
         # Add workers to the child supervisor
         for i in range(3):
             spec = child_spec(
                 id=f"worker-{i}",
-                func=worker_task,
-                args=[i],
+                module=WorkerTaskModule,
+                args=i,
                 restart=TRANSIENT,
             )
-            ok, msg = await child_handle.start_child(spec)
-            assert ok, msg
-
+            ok, msg = await dynamic_supervisor.start_child(child_pid, spec)
+            assert ok, f"Failed to start worker-{i}: {msg}"
+        
         # Let workers complete
         await asyncio.sleep(0.2)
-
-        # Parent should be empty
-        parent_children = await parent_handle.list_children()
+        
+        # Parent should be empty (no children added to it)
+        parent_children = await dynamic_supervisor.list_children(parent_pid)
         assert len(parent_children) == 0
-
+        
+        # Child supervisor should have workers (or they completed)
+        child_children = await dynamic_supervisor.list_children(child_pid)
+        # Workers may have completed (TRANSIENT), so just verify supervisor works
+        assert isinstance(child_children, list)
+        
         # Shutdown both supervisors
-        await parent_handle.shutdown()
-        await child_handle.shutdown()
+        await process.send(child_pid, SHUTDOWN)
+        await process.send(parent_pid, SHUTDOWN)
+        await asyncio.sleep(0.1)
+    
+    test_pid = await process.spawn(body, mailbox=True)
+    while process.is_alive(test_pid):
+        await asyncio.sleep(0.05)
 
-    await process.spawn(body)
 
-
-async def test_supervisor_with_mailbox_name(log_handler):
+async def test_supervisor_with_mailbox_name():
     """Test that dynamic supervisor can be accessed by name."""
-
+    
     async def body():
         # Start dynamic supervisor with a well-known name
         sup_pid = await dynamic_supervisor.start(
@@ -81,36 +112,38 @@ async def test_supervisor_with_mailbox_name(log_handler):
             options(),
             "named-supervisor",
         )
-        handle = DynamicSupervisorHandle(sup_pid)
-
+        
         # Add first child
         spec1 = child_spec(
             id="test-worker",
-            func=worker_task,
-            args=[42],
+            module=WorkerTaskModule,
+            args=42,
             restart=TRANSIENT,
         )
         ok, msg = await dynamic_supervisor.start_child("named-supervisor", spec1)
-        assert ok, msg
-
+        assert ok, f"Failed to start test-worker: {msg}"
+        
         # Add second child
         spec2 = child_spec(
             id="test-worker-2",
-            func=worker_task,
-            args=[43],
+            module=WorkerTaskModule,
+            args=43,
             restart=TRANSIENT,
         )
         ok, msg = await dynamic_supervisor.start_child("named-supervisor", spec2)
-        assert ok, msg
-
+        assert ok, f"Failed to start test-worker-2: {msg}"
+        
         # Let them start and potentially complete
         await asyncio.sleep(0.2)
-
+        
         # Query supervisor
-        children = await handle.list_children()
+        children = await dynamic_supervisor.list_children(sup_pid)
         assert isinstance(children, list)
-
+        
         # Shutdown gracefully
-        await handle.shutdown()
-
-    await process.spawn(body)
+        await process.send(sup_pid, SHUTDOWN)
+        await asyncio.sleep(0.1)
+    
+    test_pid = await process.spawn(body, mailbox=True)
+    while process.is_alive(test_pid):
+        await asyncio.sleep(0.05)

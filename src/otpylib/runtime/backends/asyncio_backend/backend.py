@@ -10,12 +10,6 @@ import uuid
 from typing import Any, Dict, List, Optional, Union, Callable, Tuple
 from contextvars import ContextVar
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from otpylib.inet.data import Socket, ListenSocket, Address, SocketOptions, ActiveMode
-
-
 from otpylib import atom
 from otpylib.runtime.backends.base import (
     RuntimeBackend, ProcessNotFoundError, NameAlreadyRegisteredError, NotInProcessError
@@ -28,12 +22,6 @@ from otpylib.runtime.atoms import (
 )
 from otpylib.runtime.atom_utils import (
     is_normal_exit, format_down_message, format_exit_message
-)
-from otpylib.inet.data import (
-    Socket,
-    ListenSocket,
-    Address,
-    SocketOptions,
 )
 
 from otpylib.runtime.backends.asyncio_backend.process import Process, ProcessMailbox
@@ -582,76 +570,3 @@ class AsyncIOBackend(RuntimeBackend):
         self._startup_time = time.time()
 
         await self.send(LOGGER, ("log", "DEBUG", "[reset] AsyncIOBackend reset complete", {}))
-
-    # =========================================================================
-    # TCP/IP Networking (inet support)
-    # =========================================================================
-
-    async def tcp_connect(self, host: str, port: int, options: SocketOptions) -> Socket:
-        """Connect to TCP endpoint."""
-        return await tcp.connect(host, port, options)
-
-    async def tcp_listen(self, port: int, options: SocketOptions) -> ListenSocket:
-        """Create listening TCP socket."""
-        return await tcp.listen(port, options)
-
-    async def tcp_accept(self, listen_socket: ListenSocket, timeout: Optional[float] = None) -> Socket:
-        """Accept connection from listening socket."""
-        return await tcp.accept(listen_socket, timeout)
-
-    async def tcp_send(self, socket: Socket, data: bytes) -> None:
-        """Send data on TCP socket."""
-        return await tcp.send(socket, data)
-
-    async def tcp_recv(self, socket: Socket, length: int, timeout: Optional[float]) -> bytes:
-        """Receive data from TCP socket."""
-        return await tcp.recv(socket, length, timeout)
-
-    async def tcp_close(self, socket: Socket) -> None:
-        """Close TCP socket."""
-        return await tcp.close(socket)
-
-    async def tcp_shutdown(self, socket: Socket, how: str) -> None:
-        """Shutdown part of connection."""
-        return await tcp.shutdown(socket, how)
-
-    async def tcp_peername(self, socket: Socket) -> Address:
-        """Get remote address."""
-        return await tcp.peername(socket)
-
-    async def tcp_sockname(self, socket: Socket) -> Address:
-        """Get local address."""
-        return await tcp.sockname(socket)
-
-    async def tcp_setopts(self, socket: Socket, options: SocketOptions) -> None:
-        """Set socket options, handling active mode changes."""
-        # Check if active mode is changing
-        old_options = socket.options
-        old_active = old_options.active if old_options else ActiveMode.PASSIVE
-        new_active = options.active
-
-        if old_active != new_active:
-            # Active mode changed - enable/disable reader
-            controlling_pid = self.self()
-            if not controlling_pid:
-                # If not in a process context, can't enable active mode
-                if new_active != ActiveMode.PASSIVE:
-                    raise NotInProcessError("Cannot enable active mode outside process context")
-            else:
-                # Enable or disable active mode
-                await tcp.set_active_mode(
-                    socket,
-                    new_active == ActiveMode.ACTIVE,
-                    controlling_pid,
-                    self
-                )
-
-        return await tcp.setopts(socket, options)
-
-    async def tcp_getopts(self, socket: Socket) -> SocketOptions:
-        """Get socket options."""
-        return await tcp.getopts(socket)
-
-    async def tcp_controlling_process(self, socket: Socket, pid: str) -> None:
-        """Change controlling process for active mode."""
-        return await tcp.controlling_process(socket, pid, self)

@@ -361,7 +361,19 @@ class AsyncIOBackend(RuntimeBackend):
         await self.send(LOGGER, ("log", "DEBUG", f"[send_after] ref={ref} delay={delay}s target={target}",
                                 {"ref": ref, "delay": delay, "target": target}))
         return ref
-    
+
+    def read_timer(self, ref: str) -> Optional[float]:
+        """Check timer without cancelling. Returns remaining seconds or None."""
+        timer_info = self._timers.get(ref)
+        if not timer_info:
+            return None
+        
+        task, end_time = timer_info
+        if task.done():
+            return None
+        
+        return max(0, end_time - time.time())
+
     async def cancel_timer(self, ref: str) -> Optional[float]:
         """Cancel timer. Returns remaining seconds or None if already fired."""
         timer_info = self._timers.pop(ref, None)
@@ -382,7 +394,7 @@ class AsyncIOBackend(RuntimeBackend):
             return remaining
         
         return None
-    
+
     def read_timer(self, ref: str) -> Optional[float]:
         """Check timer without cancelling. Returns remaining seconds or None."""
         timer_info = self._timers.get(ref)

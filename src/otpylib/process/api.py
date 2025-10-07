@@ -112,6 +112,43 @@ async def send(target: str, message: Any) -> None:
     await runtime.send(target, message)
 
 
+async def send_after(target: str, message: Any) -> None:
+    """
+    Send a message to a process.
+    
+    :param target: Process PID or registered name
+    :param message: Message to send
+    """
+    runtime = get_runtime()
+    if not runtime:
+        raise RuntimeError("No runtime backend configured")
+    
+    await runtime.send_after(target, message)
+
+
+async def read_timer(ref: str) -> Optional[float]:
+    """
+    Send a message to a process.
+    
+    :param target: Process PID or registered name
+    :param message: Message to send
+    """
+    runtime = get_runtime()
+    if not runtime:
+        raise RuntimeError("No runtime backend configured")
+    
+    await runtime.read_timer(ref)
+
+
+async def cancel_timer(ref: str) -> None:
+    """Cancel timer. Returns remaining seconds or None if already fired."""
+    runtime = get_runtime()
+    if not runtime:
+        raise RuntimeError("No runtime backend configured")
+    
+    await runtime.cancel_timer(ref)
+
+
 async def receive(
     timeout: Optional[float] = None,
     match: Optional[Callable[[Any], bool]] = None

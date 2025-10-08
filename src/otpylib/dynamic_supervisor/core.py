@@ -343,47 +343,17 @@ def _validate_child_spec(spec: child_spec):
 
 
 async def _start_child(child: _ChildState):
-    """Start a child process from its child_spec."""
+    """
+    Start a child process from its child_spec.
+    
+    Uses the OTPModule's universal start_link which routes to the
+    appropriate behavior implementation.
+    """
     spec = child.spec
     module_class = spec.module
-    behavior = get_behavior(module_class)
     
-    # Import here to avoid circular dependency
-    from otpylib import (
-        gen_server,
-        supervisor,
-        dynamic_supervisor,
-    )
-    
-    # Start based on behavior
-    if behavior.name == 'gen_server':
-        pid = await gen_server.start_link(
-            module_class,
-            init_arg=spec.args,
-            name=spec.name
-        )
-    elif behavior.name == 'supervisor':
-        pid = await supervisor.start_link(
-            module_class,
-            init_arg=spec.args,
-            name=spec.name
-        )
-    elif behavior.name == 'dynamic_supervisor':
-        pid = await dynamic_supervisor.start_link(
-            module_class,
-            init_arg=spec.args,
-            name=spec.name
-        )
-    elif behavior.name == 'task':
-        # For TASK behavior, spawn directly
-        instance = module_class()
-        pid = await process.spawn_link(
-            instance.run,
-            args=[spec.args],
-            mailbox=True
-        )
-    else:
-        raise RuntimeError(f"Unsupported child behavior: {behavior.name}")
+    # Call the module's start_link - OTPModule metaclass routes to correct behavior
+    pid = await module_class.start_link(init_arg=spec.args, name=spec.name)
     
     # Monitor the child
     monitor_ref = await process.monitor(pid)

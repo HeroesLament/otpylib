@@ -11,7 +11,8 @@ that only well-formed modules are created.
 import asyncio
 import inspect
 import time
-from typing import Dict, Any, Callable, Set, List, Tuple
+import importlib
+from typing import Dict, Any, Callable, Set, List, Tuple, Optional
 
 from otpylib.atom import ensure, Atom
 
@@ -225,6 +226,7 @@ class OTPModule(type):
     2. Validates that the behavior contract is satisfied
     3. Attaches comprehensive metadata to the class
     4. Ensures modules are well-formed before reaching runtime
+    5. Provides a universal start_link that routes to the behavior's implementation
     
     Usage:
         class MyServer(metaclass=OTPModule, behavior=GEN_SERVER, version="1.0.0"):
@@ -246,6 +248,7 @@ class OTPModule(type):
         - Collect callbacks from namespace
         - Validate behavior contract
         - Attach metadata attributes
+        - Add universal start_link method
         
         Args:
             name: Class name
@@ -323,6 +326,46 @@ class OTPModule(type):
         
         # Mark as created and validated
         cls.__state__ = VALIDATED
+        
+        # Add the universal start_link classmethod that routes to behavior implementation
+        async def _start_link(init_arg: Any = None, name: Optional[str] = None) -> str:
+            """
+            Start this OTPModule using its behavior's start_link.
+            
+            This method dynamically routes to the appropriate behavior module
+            based on the module's declared behavior (gen_server, supervisor, etc.)
+            
+            Args:
+                init_arg: Initialization argument passed to the module's init callback
+                name: Optional registered name for the process
+                
+            Returns:
+                Process PID
+            """
+            behavior_name = cls.__behavior__.name
+            
+            # Convention: behaviors live in otpylib.{behavior_name}
+            # e.g., gen_server -> otpylib.gen_server
+            #       supervisor -> otpylib.supervisor
+            #       dynamic_supervisor -> otpylib.dynamic_supervisor
+            try:
+                behavior_module = importlib.import_module(f"otpylib.{behavior_name}")
+            except ImportError as e:
+                raise RuntimeError(
+                    f"Cannot import behavior module 'otpylib.{behavior_name}' for {cls.__name__}: {e}"
+                )
+            
+            # Every behavior module must provide a start_link function
+            if not hasattr(behavior_module, 'start_link'):
+                raise RuntimeError(
+                    f"Behavior module 'otpylib.{behavior_name}' does not provide start_link function"
+                )
+            
+            # Call the behavior's start_link with this class
+            return await behavior_module.start_link(cls, init_arg=init_arg, name=name)
+        
+        # Attach as a classmethod so it can be called as: MyModule.start_link(...)
+        cls.start_link = classmethod(lambda cls, init_arg=None, name=None: _start_link(init_arg, name))
         
         return cls
     

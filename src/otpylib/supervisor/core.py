@@ -142,8 +142,13 @@ async def _shutdown_children(children: Dict[str, _ChildState]):
                 pass
 
 
-async def _start_child(child: _ChildState, gen_server_module):
-    """Start a child process from its child_spec."""
+async def _start_child(child: _ChildState):
+    """
+    Start a child process from its child_spec.
+    
+    Uses the OTPModule's universal start_link which routes to the
+    appropriate behavior implementation.
+    """
     spec = child.spec
     child_id = spec.id
     module_class = spec.module
@@ -151,15 +156,8 @@ async def _start_child(child: _ChildState, gen_server_module):
     name = spec.name
     
     try:
-        behavior = get_behavior(module_class)
-        
-        if behavior.name == 'gen_server':
-            pid = await gen_server_module.start_link(module_class, init_arg=args, name=name)
-        elif behavior.name == 'supervisor':
-            # Recursive supervisor
-            pid = await start_link(module_class, init_arg=args, name=name)
-        else:
-            raise RuntimeError(f"Unsupported child behavior: {behavior.name}")
+        # Call the module's start_link - OTPModule metaclass routes to correct behavior
+        pid = await module_class.start_link(init_arg=args, name=name)
         
         monitor_ref = await process.monitor(pid)
         
@@ -171,14 +169,14 @@ async def _start_child(child: _ChildState, gen_server_module):
 
 
 async def _restart_child(child: _ChildState, intensity_times: deque, 
-                        max_restarts: int, max_seconds: int, gen_server_module):
+                        max_restarts: int, max_seconds: int):
     """Restart a single child with intensity accounting."""
     if _record_restart(intensity_times, max_restarts, max_seconds):
         raise _IntensityExceeded()
     
     await _mark_down(child)
     child.restart_count += 1
-    await _start_child(child, gen_server_module)
+    await _start_child(child)
 
 
 # ============================================================================
@@ -243,9 +241,6 @@ async def _supervisor_loop(module_class: type, init_arg: Any, parent_pid: str):
     pid = process.self()
     modname = module_class.__mod_id__
     
-    # Import gen_server here to avoid circular dependency
-    from otpylib import gen_server
-    
     try:
         # Create supervisor instance
         supervisor_instance = module_class()
@@ -302,7 +297,7 @@ async def _supervisor_loop(module_class: type, init_arg: Any, parent_pid: str):
         
         # Start all children
         for child_id in start_order:
-            await _start_child(children[child_id], gen_server)
+            await _start_child(children[child_id])
         
         # Send init success
         child_ids = list(children.keys())
@@ -334,7 +329,7 @@ async def _supervisor_loop(module_class: type, init_arg: Any, parent_pid: str):
                             await _handle_child_exit(
                                 children, cid, reason, strategy_atom,
                                 start_order, intensity_times, 
-                                max_restarts, max_seconds, gen_server
+                                max_restarts, max_seconds
                             )
                 
                 # Shutdown
@@ -367,8 +362,7 @@ async def _handle_child_exit(
     start_order: List[str],
     intensity_times: deque,
     max_restarts: int,
-    max_seconds: int,
-    gen_server_module
+    max_seconds: int
 ):
     """Handle a child exit based on supervisor strategy."""
     child = children[dead_id]
@@ -378,7 +372,7 @@ async def _handle_child_exit(
         return
     
     if strategy == ONE_FOR_ONE:
-        await _restart_child(child, intensity_times, max_restarts, max_seconds, gen_server_module)
+        await _restart_child(child, intensity_times, max_restarts, max_seconds)
     
     elif strategy == ONE_FOR_ALL:
         for cid, other in children.items():
@@ -390,7 +384,7 @@ async def _handle_child_exit(
             await _mark_down(other)
         
         for cid in start_order:
-            await _restart_child(children[cid], intensity_times, max_restarts, max_seconds, gen_server_module)
+            await _restart_child(children[cid], intensity_times, max_restarts, max_seconds)
     
     elif strategy == REST_FOR_ONE:
         idx = start_order.index(dead_id)
@@ -406,4 +400,4 @@ async def _handle_child_exit(
             await _mark_down(c)
         
         for cid in victims:
-            await _restart_child(children[cid], intensity_times, max_restarts, max_seconds, gen_server_module)
+            await _restart_child(children[cid], intensity_times, max_restarts, max_seconds)

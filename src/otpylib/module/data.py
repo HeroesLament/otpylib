@@ -572,6 +572,35 @@ CALLBACK_SIGNATURES: Dict[Atom, Dict[str, CallbackSignature]] = {
             param_names=['self', 'state'],
             returns="None"
         )
+    },
+    
+    GEN_STATEM: {
+        'init': CallbackSignature(
+            name='init',
+            arity=2,  # self, args
+            param_names=['self', 'args'],
+            returns="(state_name, state_data) or (state_name, state_data, actions)"
+        ),
+        'callback_mode': CallbackSignature(
+            name='callback_mode',
+            arity=1,  # self
+            param_names=['self'],
+            returns="CallbackMode.STATE_FUNCTIONS or CallbackMode.HANDLE_EVENT_FUNCTION"
+        ),
+        'terminate': CallbackSignature(
+            name='terminate',
+            arity=4,  # self, reason, state_name, state_data
+            param_names=['self', 'reason', 'state_name', 'state_data'],
+            returns="None"
+        ),
+        # Note: State functions (state_<name>) are dynamic and validated at runtime
+        # handle_event is only required if callback_mode returns HANDLE_EVENT_FUNCTION
+        'handle_event': CallbackSignature(
+            name='handle_event',
+            arity=5,  # self, event_type, event_content, state_name, state_data
+            param_names=['self', 'event_type', 'event_content', 'state_name', 'state_data'],
+            returns="NextState | KeepState | RepeatState | StopState"
+        )
     }
 }
 

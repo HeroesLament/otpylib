@@ -221,7 +221,7 @@ def whereis_name(name: str) -> Optional[str]:
     if not runtime:
         return None
     
-    return runtime.whereis_name()
+    return runtime.whereis_name(name)
 
 
 def self() -> Optional[str]:

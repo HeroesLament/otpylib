@@ -213,6 +213,64 @@ class RuntimeBackend(Protocol):
         ...
     
     # =========================================================================
+    # Timing Operations
+    # =========================================================================
+    
+    async def sleep(self, seconds: float) -> None:
+        """
+        Suspend the current process for the specified duration.
+        
+        Uses timing wheel internally for consistency with send_after().
+        Backend implementations should use their native timing mechanism
+        (e.g., asyncio.Event for AsyncIOBackend).
+        
+        BEAM equivalent: timer:sleep(Milliseconds)
+        
+        :param seconds: Duration to sleep in seconds
+        """
+        ...
+    
+    async def send_after(
+        self,
+        delay: float,
+        target: str,
+        message: Any
+    ) -> str:
+        """
+        Send a message to a process after a delay.
+        
+        BEAM equivalent: erlang:send_after(Time, Dest, Msg)
+        
+        :param delay: Delay in seconds before sending message
+        :param target: Process PID or registered name
+        :param message: Message to send
+        :returns: Timer reference for cancellation
+        """
+        ...
+    
+    async def cancel_timer(self, ref: str) -> bool:
+        """
+        Cancel a timer by reference.
+        
+        BEAM equivalent: erlang:cancel_timer(TimerRef)
+        
+        :param ref: Timer reference returned by send_after()
+        :returns: True if timer was cancelled, False if already fired or not found
+        """
+        ...
+    
+    async def read_timer(self, ref: str) -> Optional[float]:
+        """
+        Read remaining time on a timer in seconds.
+        
+        BEAM equivalent: erlang:read_timer(TimerRef)
+        
+        :param ref: Timer reference
+        :returns: Remaining time in seconds, or None if timer not found
+        """
+        ...
+    
+    # =========================================================================
     # Process Registry
     # =========================================================================
     

@@ -487,14 +487,14 @@ async def _gen_statem_loop(module_class: type, init_arg: Any, caller_pid: str) -
 
     # --- Main loop state ---
     postponed_events = []
-    state_timeout_task = None
-    
+    state_timeout_ref = None
+
     # Process initial actions
     for action in actions:
         if isinstance(action, StateTimeoutAction):
-            if state_timeout_task:
-                state_timeout_task.cancel()
-            state_timeout_task = asyncio.create_task(_schedule_timeout(pid, action))
+            if state_timeout_ref:
+                await process.cancel_timer(state_timeout_ref)
+            state_timeout_ref = await _schedule_timeout(pid, action)
 
     # --- Main loop ---
     try:
@@ -549,9 +549,9 @@ async def _gen_statem_loop(module_class: type, init_arg: Any, caller_pid: str) -
                 # Handle state change cleanup BEFORE processing actions
                 if state_changed:
                     # Cancel old state timeout
-                    if state_timeout_task:
-                        state_timeout_task.cancel()
-                        state_timeout_task = None
+                    if state_timeout_ref:
+                        await process.cancel_timer(state_timeout_ref)
+                        state_timeout_ref = None
                 
                 # Process actions
                 postpone_current = False
@@ -564,9 +564,9 @@ async def _gen_statem_loop(module_class: type, init_arg: Any, caller_pid: str) -
                         
                         case StateTimeoutAction() as timeout_action:
                             # Cancel any existing timeout before setting new one
-                            if state_timeout_task:
-                                state_timeout_task.cancel()
-                            state_timeout_task = asyncio.create_task(_schedule_timeout(pid, timeout_action))
+                            if state_timeout_ref:
+                                await process.cancel_timer(state_timeout_ref)
+                            state_timeout_ref = await _schedule_timeout(pid, timeout_action)
                         
                         case PostponeAction():
                             postpone_current = True
@@ -658,11 +658,15 @@ async def _handle_event(
         return await module_instance.handle_event(event_type, event_content, state_name, state_data)
 
 
-async def _schedule_timeout(pid: str, action: StateTimeoutAction):
-    """Schedule a state timeout."""
-    await asyncio.sleep(action.timeout)
+async def _schedule_timeout(pid: str, action: StateTimeoutAction) -> str:
+    """
+    Schedule a state timeout using timing wheel.
+    
+    Returns timer reference for cancellation.
+    """
     msg = _TimeoutMessage(timeout_type="state_timeout", event_content=action.event_content)
-    await process.send(pid, msg)
+    ref = await process.send_after(action.timeout, pid, msg)
+    return ref
 
 
 async def _terminate(module_instance, reason, state_name, state_data):

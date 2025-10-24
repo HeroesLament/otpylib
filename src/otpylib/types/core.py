@@ -142,9 +142,3 @@ def is_cancellation_exception(exception: BaseException) -> bool:
         pass
         
     return False
-
-
-# Backend-aware sleep function for tenacity
-async def anyio_sleep(seconds: float) -> None:
-    """Sleep function compatible with anyio backends."""
-    await asyncio.sleep(seconds)

@@ -24,6 +24,7 @@ from otpylib.runtime.atom_utils import (
     is_normal_exit, format_down_message, format_exit_message
 )
 
+from otpylib.runtime.backends.asyncio_backend.timing_wheel import TimingWheel
 from otpylib.runtime.backends.asyncio_backend.process import Process, ProcessMailbox
 from otpylib.runtime.backends.asyncio_backend import tcp
 
@@ -50,7 +51,9 @@ class AsyncIOBackend(RuntimeBackend):
         self._monitors: Dict[str, MonitorRef] = {}  # ref -> MonitorRef
 
         # Timer tracking
-        self._timers: Dict[str, Tuple[asyncio.Task, float]] = {}
+        self.timing_wheel = TimingWheel(tick_ms=10, num_slots=512)
+        self._wheel_task: Optional[asyncio.Task] = None
+        self._shutdown_flag = False
 
         # Statistics
         self._stats = {
@@ -341,59 +344,91 @@ class AsyncIOBackend(RuntimeBackend):
         await process.mailbox.send(message)
         self._stats["messages_sent"] += 1
 
+    async def sleep(self, seconds: float) -> None:
+        """
+        Suspend the current coroutine for the specified duration.
+
+        Uses timing wheel internally for consistency with send_after().
+
+        :param seconds: Duration to sleep in seconds
+        """
+        # Create event to wait on
+        done = asyncio.Event()
+
+        # Generate unique reference
+        ref = f"sleep_{id(done)}_{time.monotonic()}"
+
+        # Insert callback-based timer into wheel
+        self.timing_wheel.insert(
+            ref=ref,
+            delay_ms=int(seconds * 1000),
+            target="",  # Unused for callbacks
+            message=None,  # Unused for callbacks
+            callback=lambda: done.set()  # Wake up sleeper
+        )
+
+        # Wait for timer to fire
+        try:
+            await done.wait()
+        except asyncio.CancelledError:
+            # If cancelled, cancel the timer too
+            self.timing_wheel.cancel(ref)
+            raise
+
     async def send_after(self, delay: float, target: str, message: Any) -> str:
-        """Send message after delay. Returns timer ref for cancellation."""
+        """
+        Send message after delay using timing wheel.
+
+        :param delay: Delay in seconds before sending message
+        :param target: Target process PID or registered name
+        :param message: Message to send when timer fires
+        :returns: Timer reference for cancellation
+        """
         ref = f"timer_{uuid.uuid4().hex[:12]}"
-        
-        async def delayed_send():
-            try:
-                await asyncio.sleep(delay)
-                await self.send(target, message)
-            except asyncio.CancelledError:
-                pass
-            finally:
-                self._timers.pop(ref, None)
-        
-        task = asyncio.create_task(delayed_send())
-        end_time = time.time() + delay
-        self._timers[ref] = (task, end_time)
-        
-        await self.send(LOGGER, ("log", "DEBUG", f"[send_after] ref={ref} delay={delay}s target={target}",
-                                {"ref": ref, "delay": delay, "target": target}))
+
+        # Insert into timing wheel
+        self.timing_wheel.insert(
+            ref=ref,
+            delay_ms=int(delay * 1000),
+            target=target,
+            message=message,
+            callback=None  # Message-based timer
+        )
+
+        await self.send(LOGGER, ("log", "DEBUG",
+            f"[send_after] ref={ref} delay={delay}s target={target}",
+            {"ref": ref, "delay": delay, "target": target}))
+
         return ref
 
-    def read_timer(self, ref: str) -> Optional[float]:
-        """Check timer without cancelling. Returns remaining seconds or None."""
-        timer_info = self._timers.get(ref)
-        if not timer_info:
-            return None
-        
-        task, end_time = timer_info
-        if task.done():
-            return None
-        
-        return max(0, end_time - time.time())
 
-    async def cancel_timer(self, ref: str) -> Optional[float]:
-        """Cancel timer. Returns remaining seconds or None if already fired."""
-        timer_info = self._timers.pop(ref, None)
-        if not timer_info:
-            return None
-        
-        task, end_time = timer_info
-        if not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            
-            remaining = max(0, end_time - time.time())
-            await self.send(LOGGER, ("log", "DEBUG", f"[cancel_timer] ref={ref} remaining={remaining:.2f}s",
-                                    {"ref": ref, "remaining": remaining}))
-            return remaining
-        
-        return None
+    async def cancel_timer(self, ref: str) -> bool:
+        """
+        Cancel a timer by reference.
+
+        :param ref: Timer reference returned by send_after()
+        :returns: True if timer was cancelled, False if not found
+        """
+        cancelled = self.timing_wheel.cancel(ref)
+
+        if cancelled:
+            await self.send(LOGGER, ("log", "DEBUG",
+                f"[cancel_timer] ref={ref} cancelled",
+                {"ref": ref}))
+
+        return cancelled
+
+
+    async def read_timer(self, ref: str) -> Optional[float]:
+        """
+        Read remaining time on a timer in seconds.
+
+        :param ref: Timer reference
+        :returns: Remaining time in seconds, or None if timer not found
+        """
+        remaining_ms = self.timing_wheel.read_timer(ref)
+        return remaining_ms / 1000.0 if remaining_ms is not None else None
+
 
     async def receive(self, timeout: Optional[float] = None,
                       match: Optional[Callable[[Any], bool]] = None) -> Any:
@@ -486,10 +521,22 @@ class AsyncIOBackend(RuntimeBackend):
     # =========================================================================
 
     async def initialize(self) -> None:
+        # Start timing wheel here
+        self._shutdown_flag = False
+        self._wheel_task = asyncio.create_task(self._run_timing_wheel())
         await self.send(LOGGER, ("log", "DEBUG", "[initialize] AsyncIOBackend initialized", {}))
 
     async def shutdown(self) -> None:
         """Gracefully shutdown the backend: kill all processes."""
+        # Stop timing wheel FIRST
+        self._shutdown_flag = True
+        if self._wheel_task:
+            self._wheel_task.cancel()
+            try:
+                await self._wheel_task
+            except asyncio.CancelledError:
+                pass
+
         await self.send(LOGGER, ("log", "INFO", "[backend] shutting down runtime", {}))
         for pid, proc in list(self._processes.items()):
             try:
@@ -524,6 +571,32 @@ class AsyncIOBackend(RuntimeBackend):
     # =========================================================================
     # Internal Methods
     # =========================================================================
+
+    async def _run_timing_wheel(self):
+        """Background task - ticks the wheel every 10ms."""
+        while not self._shutdown_flag:
+            try:
+                expired = self.timing_wheel.tick()
+                for timer in expired:
+                    if timer.callback:
+                        # Callback-based timer (for sleep)
+                        try:
+                            timer.callback()
+                        except Exception as e:
+                            await self.send(LOGGER, ("log", "ERROR", 
+                                f"[timing_wheel] callback error: {e}",
+                                {"ref": timer.ref, "error": str(e)}))
+                    else:
+                        # Message-based timer (for send_after)
+                        asyncio.create_task(self.send(timer.target, timer.message))
+
+                await asyncio.sleep(0.01)  # 10ms tick
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                await self.send(LOGGER, ("log", "ERROR",
+                    f"[timing_wheel] tick error: {e}",
+                    {"error": str(e)}))
 
     async def _handle_process_exit(self, pid: str, reason: Any) -> None:
         """Handle process exit: notify links and monitors."""
@@ -609,6 +682,15 @@ class AsyncIOBackend(RuntimeBackend):
 
     async def reset(self) -> None:
         """Reset all backend state. Only for test isolation (pytest)."""
+        # Stop wheel
+        self._shutdown_flag = True
+        if self._wheel_task:
+            self._wheel_task.cancel()
+            try:
+                await self._wheel_task
+            except asyncio.CancelledError:
+                pass
+
         for process in list(self._processes.values()):
             if process.task and not process.task.done():
                 process.task.cancel()
@@ -616,6 +698,10 @@ class AsyncIOBackend(RuntimeBackend):
         self._processes.clear()
         self._name_registry.clear()
         self._monitors.clear()
+
+        self.timing_wheel = TimingWheel(tick_ms=10, num_slots=512)
+        self._shutdown_flag = False
+        self._wheel_task = asyncio.create_task(self._run_timing_wheel())
 
         self._stats.update({
             "total_spawned": 0,

@@ -322,11 +322,15 @@ async def test_cancel_timer_before_fire(runtime, process_tracker):
     
     # Cancel before it fires
     await asyncio.sleep(0.05)
-    remaining = await runtime.cancel_timer(timer_ref)
     
-    # Should have ~0.10s remaining
+    # Read remaining time first (if we want to check it)
+    remaining = await runtime.read_timer(timer_ref)
     assert remaining is not None
     assert 0.08 <= remaining <= 0.12
+    
+    # Now cancel
+    cancelled = await runtime.cancel_timer(timer_ref)
+    assert cancelled is True  # Timer was successfully cancelled
     
     # Wait to ensure message doesn't arrive
     await asyncio.sleep(0.15)
@@ -353,10 +357,10 @@ async def test_cancel_timer_after_fire(runtime, process_tracker):
     await asyncio.sleep(0.1)
     
     # Try to cancel after fire
-    remaining = await runtime.cancel_timer(timer_ref)
+    cancelled = await runtime.cancel_timer(timer_ref)
     
-    # Should return None (already fired)
-    assert remaining is None
+    # Should return False (already fired)
+    assert cancelled is False
     
     # Message should have been received
     assert received == [DELAYED_MSG]
@@ -365,8 +369,8 @@ async def test_cancel_timer_after_fire(runtime, process_tracker):
 @pytest.mark.asyncio
 async def test_cancel_timer_nonexistent(runtime, process_tracker):
     """Test cancelling a nonexistent timer ref."""
-    remaining = await runtime.cancel_timer("invalid_ref_12345")
-    assert remaining is None
+    cancelled = await runtime.cancel_timer("invalid_ref_12345")
+    assert cancelled is False
 
 
 @pytest.mark.asyncio
@@ -382,19 +386,19 @@ async def test_read_timer_active(runtime, process_tracker):
     timer_ref = await runtime.send_after(0.2, pid, TIMER_MSG)
     
     # Read timer immediately
-    remaining1 = runtime.read_timer(timer_ref)
+    remaining1 = await runtime.read_timer(timer_ref)
     assert remaining1 is not None
     assert 0.18 <= remaining1 <= 0.22
     
     # Wait a bit and read again
     await asyncio.sleep(0.1)
-    remaining2 = runtime.read_timer(timer_ref)
+    remaining2 = await runtime.read_timer(timer_ref)
     assert remaining2 is not None
     assert 0.08 <= remaining2 <= 0.12
     
     # Timer should still fire
     await asyncio.sleep(0.15)
-    remaining3 = runtime.read_timer(timer_ref)
+    remaining3 = await runtime.read_timer(timer_ref)
     assert remaining3 is None  # Already fired
 
 
@@ -412,7 +416,7 @@ async def test_read_timer_fired(runtime, process_tracker):
     # Wait for fire
     await asyncio.sleep(0.1)
     
-    remaining = runtime.read_timer(timer_ref)
+    remaining = await runtime.read_timer(timer_ref)
     assert remaining is None
 
 
@@ -432,7 +436,7 @@ async def test_read_timer_cancelled(runtime, process_tracker):
     await runtime.cancel_timer(timer_ref)
     
     # Try to read cancelled timer
-    remaining = runtime.read_timer(timer_ref)
+    remaining = await runtime.read_timer(timer_ref)
     assert remaining is None
 
 
@@ -471,14 +475,14 @@ async def test_timer_cleanup_on_cancel(runtime, process_tracker):
         refs.append(ref)
     
     # Check timers exist
-    assert len(runtime._timers) >= 5
+    assert runtime.timing_wheel.get_active_count() >= 5
     
     # Cancel all
     for ref in refs:
         await runtime.cancel_timer(ref)
     
     # Timers should be cleaned up
-    assert len(runtime._timers) == 0
+    assert runtime.timing_wheel.get_active_count() == 0
 
 
 @pytest.mark.asyncio

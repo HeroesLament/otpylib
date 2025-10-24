@@ -112,41 +112,96 @@ async def send(target: str, message: Any) -> None:
     await runtime.send(target, message)
 
 
-async def send_after(delay: float, target: str, message: Any) -> None:
+# ============================================================================
+# Timing Operations
+# ============================================================================
+
+async def sleep(seconds: float) -> None:
     """
-    Send a message to a process.
+    Suspend the current process for the specified duration.
     
-    :param target: Process PID or registered name
-    :param message: Message to send
+    Uses timing wheel internally for consistency with send_after().
+    
+    BEAM equivalent: timer:sleep(Milliseconds)
+    
+    :param seconds: Duration to sleep in seconds
+    
+    Example:
+        await process.sleep(5.0)  # Sleep for 5 seconds
     """
     runtime = get_runtime()
     if not runtime:
         raise RuntimeError("No runtime backend configured")
     
-    await runtime.send_after(delay, target, message)
+    await runtime.sleep(seconds)
+
+
+async def send_after(delay: float, target: str, message: Any) -> str:
+    """
+    Send a message to a process after a delay.
+    
+    BEAM equivalent: erlang:send_after(Time, Dest, Msg)
+    
+    :param delay: Delay in seconds before sending message
+    :param target: Process PID or registered name
+    :param message: Message to send
+    :returns: Timer reference for cancellation
+    
+    Example:
+        ref = await process.send_after(5.0, "door_lock", ("timeout",))
+        # Cancel if needed
+        cancelled = await process.cancel_timer(ref)
+    """
+    runtime = get_runtime()
+    if not runtime:
+        raise RuntimeError("No runtime backend configured")
+    
+    return await runtime.send_after(delay, target, message)
+
+
+async def cancel_timer(ref: str) -> bool:
+    """
+    Cancel a timer by reference.
+    
+    BEAM equivalent: erlang:cancel_timer(TimerRef)
+    
+    :param ref: Timer reference returned by send_after()
+    :returns: True if timer was cancelled, False if already fired or not found
+    
+    Example:
+        ref = await process.send_after(10.0, "worker", "msg")
+        await asyncio.sleep(2.0)
+        cancelled = await process.cancel_timer(ref)
+        if cancelled:
+            print("Timer cancelled successfully")
+    """
+    runtime = get_runtime()
+    if not runtime:
+        raise RuntimeError("No runtime backend configured")
+    
+    return await runtime.cancel_timer(ref)
 
 
 async def read_timer(ref: str) -> Optional[float]:
     """
-    Send a message to a process.
+    Read remaining time on a timer in seconds.
     
-    :param target: Process PID or registered name
-    :param message: Message to send
+    BEAM equivalent: erlang:read_timer(TimerRef)
+    
+    :param ref: Timer reference
+    :returns: Remaining time in seconds, or None if timer not found
+    
+    Example:
+        ref = await process.send_after(10.0, "worker", "msg")
+        await asyncio.sleep(3.0)
+        remaining = await process.read_timer(ref)
+        # remaining ≈ 7.0
     """
     runtime = get_runtime()
     if not runtime:
         raise RuntimeError("No runtime backend configured")
     
-    await runtime.read_timer(ref)
-
-
-async def cancel_timer(ref: str) -> None:
-    """Cancel timer. Returns remaining seconds or None if already fired."""
-    runtime = get_runtime()
-    if not runtime:
-        raise RuntimeError("No runtime backend configured")
-    
-    await runtime.cancel_timer(ref)
+    return await runtime.read_timer(ref)
 
 
 async def receive(

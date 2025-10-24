@@ -9,7 +9,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from otpylib import process
+from otpylib import atom, process
 from otpylib.module import get_behavior, is_otp_module, ModuleError
 
 from otpylib.dynamic_supervisor.atoms import (
@@ -70,12 +70,15 @@ class _SupervisorState:
 # Supervisor Control Messages (Atoms)
 # ============================================================================
 
-GET_CHILD_STATUS = "get_child_status"
-LIST_CHILDREN = "list_children"
-WHICH_CHILDREN = "which_children"
-COUNT_CHILDREN = "count_children"
-ADD_CHILD = "add_child"
-TERMINATE_CHILD = "terminate_child"
+GET_CHILD_STATUS = atom.ensure("get_child_status")
+LIST_CHILDREN = atom.ensure("list_children")
+WHICH_CHILDREN = atom.ensure("which_children")
+COUNT_CHILDREN = atom.ensure("count_children")
+ADD_CHILD = atom.ensure("add_child")
+TERMINATE_CHILD = atom.ensure("terminate_child")
+OK = atom.ensure("ok")
+ERROR = atom.ensure("error")
+NOT_FOUND = atom.ensure("not_found")
 
 
 # ============================================================================
@@ -183,13 +186,13 @@ async def start(
 # Dynamic Child Management API
 # ============================================================================
 
-async def start_child(supervisor_pid: str, spec: child_spec) -> Tuple[bool, str]:
+async def start_child(supervisor_pid: str, spec: child_spec) -> Tuple[atom.Atom, str]:
     """Dynamically add and start a child under the supervisor."""
     await process.send(supervisor_pid, (ADD_CHILD, spec, process.self()))
     return await process.receive(timeout=5.0)
 
 
-async def terminate_child(supervisor_pid: str, child_id: str) -> Tuple[bool, str]:
+async def terminate_child(supervisor_pid: str, child_id: str) -> Tuple[atom.Atom, Optional[atom.Atom]]:
     """Terminate a dynamic child (static children cannot be terminated)."""
     await process.send(supervisor_pid, (TERMINATE_CHILD, child_id, process.self()))
     return await process.receive(timeout=5.0)
@@ -506,7 +509,7 @@ async def _handle_add_child(state: _SupervisorState, spec: child_spec, reply_to:
         _validate_child_spec(spec)
         
         if spec.id in state.children:
-            await process.send(reply_to, (False, f"Child {spec.id} already exists"))
+            await process.send(reply_to, (ERROR, f"Child {spec.id} already exists"))
             return
         
         # Create and start child
@@ -515,14 +518,14 @@ async def _handle_add_child(state: _SupervisorState, spec: child_spec, reply_to:
         state.dynamic_children.append(spec.id)
         
         await _start_child(child_state)
-        await process.send(reply_to, (True, f"Child {spec.id} started successfully"))
+        await process.send(reply_to, (OK, child_state.pid))
     
     except Exception as e:
         # Cleanup on failure
         state.children.pop(spec.id, None)
         if spec.id in state.dynamic_children:
             state.dynamic_children.remove(spec.id)
-        await process.send(reply_to, (False, f"Failed to start child: {e}"))
+        await process.send(reply_to, (ERROR, f"Failed to start child: {e}"))
 
 
 async def _handle_terminate_child(state: _SupervisorState, child_id: str, reply_to: str):
@@ -530,18 +533,18 @@ async def _handle_terminate_child(state: _SupervisorState, child_id: str, reply_
     child = state.children.get(child_id)
     
     if not child:
-        await process.send(reply_to, (False, f"Child {child_id} not found"))
+        await process.send(reply_to, (ERROR, NOT_FOUND))
         return
     
     if not child.is_dynamic:
-        await process.send(reply_to, (False, f"Cannot terminate static child {child_id}"))
+        await process.send(reply_to, (OK,))
         return
     
     if child.pid and process.is_alive(child.pid):
         await process.exit(child.pid, SUPERVISOR_SHUTDOWN)
         state.pending_terminations[child_id] = reply_to
     else:
-        await process.send(reply_to, (True, f"Child {child_id} already terminated"))
+        await process.send(reply_to, (OK,))
 
 
 async def _handle_get_child_status(state: _SupervisorState, child_id: str, reply_to: str):

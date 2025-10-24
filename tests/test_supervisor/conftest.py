@@ -3,6 +3,7 @@ Conftest for supervisor tests.
 """
 import gc
 import pytest
+import pytest_asyncio
 import asyncio
 from otpylib.runtime import set_runtime, reset_runtime
 from otpylib.runtime.backends.asyncio_backend import AsyncIOBackend
@@ -16,12 +17,18 @@ class TestData:
         self.completed = asyncio.Event()
 
 
-@pytest.fixture(scope="function", autouse=True)
-def runtime_backend():
+@pytest_asyncio.fixture(autouse=True)
+async def runtime_backend():
     """Ensure a runtime backend is configured for all tests."""
     backend = AsyncIOBackend()
+    
+    await backend.initialize()
+    
     set_runtime(backend)
     yield backend
+    
+    # Cleanup
+    await backend.shutdown()
     reset_runtime()
 
 

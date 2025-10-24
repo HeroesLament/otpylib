@@ -27,6 +27,7 @@ from otpylib.runtime.atom_utils import (
 from otpylib.runtime.backends.asyncio_backend.timing_wheel import TimingWheel
 from otpylib.runtime.backends.asyncio_backend.process import Process, ProcessMailbox
 from otpylib.runtime.backends.asyncio_backend import tcp
+from otpylib.runtime.backends.asyncio_backend.pid import Pid, PidAllocator
 
 # Logger target
 LOGGER = atom.ensure("logger")
@@ -44,16 +45,19 @@ class AsyncIOBackend(RuntimeBackend):
 
     def __init__(self):
         # Process registry
-        self._processes: Dict[str, Process] = {}
-        self._name_registry: Dict[str, str] = {}  # name -> pid
+        self._processes: Dict[Pid, Process] = {}
+        self._name_registry: Dict[str, Pid] = {}
 
         # Monitor tracking
-        self._monitors: Dict[str, MonitorRef] = {}  # ref -> MonitorRef
+        self._monitors: Dict[str, MonitorRef] = {}
 
         # Timer tracking
         self.timing_wheel = TimingWheel(tick_ms=10, num_slots=512)
         self._wheel_task: Optional[asyncio.Task] = None
         self._shutdown_flag = False
+
+        # Pid allocator
+        self.pid_allocator: Optional[PidAllocator] = None
 
         # Statistics
         self._stats = {
@@ -80,7 +84,7 @@ class AsyncIOBackend(RuntimeBackend):
         characteristics: Optional[ProcessCharacteristics] = None,
     ) -> str:
         """Spawn a new process."""
-        pid = f"pid_{uuid.uuid4().hex[:12]}"
+        pid = await self.pid_allocator.allocate()
 
         await self.send(LOGGER, ("log", "DEBUG", f"[spawn] name={name}, pid={pid}", {"name": name, "pid": pid}))
 
@@ -524,6 +528,12 @@ class AsyncIOBackend(RuntimeBackend):
         # Start timing wheel here
         self._shutdown_flag = False
         self._wheel_task = asyncio.create_task(self._run_timing_wheel())
+
+        # Initialize PID allocator
+        node_name = "otpylib@127.0.0.1"  # Make this configurable
+        creation = 1  # TODO: Get from EPMD
+        self.pid_allocator = PidAllocator(node_name, creation)
+
         await self.send(LOGGER, ("log", "DEBUG", "[initialize] AsyncIOBackend initialized", {}))
 
     async def shutdown(self) -> None:

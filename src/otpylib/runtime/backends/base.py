@@ -7,18 +7,106 @@ Uses Protocol for type safety and clear interface contracts.
 
 from typing import Protocol, runtime_checkable, Any, Dict, List, Optional, Union, Set, Callable
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 from otpylib.runtime.data import (
     ProcessInfo, RuntimeStatistics, ProcessCharacteristics
 )
+from otpylib import atom
 
+
+# ============================================================================
+# PID (Process Identifier)
+# ============================================================================
+
+@dataclass(frozen=True, eq=True)
+class Pid:
+    """
+    Erlang Process Identifier
+    
+    A PID uniquely identifies a process in the distributed system.
+    PIDs are immutable and hashable, suitable for use as dictionary keys.
+    
+    Backend-agnostic data structure - no async/await, no locks.
+    
+    Attributes:
+        node: The node atom where the process lives
+        id: Process number (0 to 2^32-1)
+        serial: Reuse counter for ID wraparound (0 to 2^32-1)
+        creation: Node incarnation number (0 to 2^32-1)
+    
+    Examples:
+        >>> node = atom.ensure('otpylib@127.0.0.1')
+        >>> pid = Pid(node, 101, 0, 1)
+        >>> print(pid)
+        #Pid<otpylib@127.0.0.1.101.0>
+    """
+    
+    node: atom.Atom
+    id: int
+    serial: int
+    creation: int
+    
+    def __post_init__(self):
+        """Validate PID fields"""
+        if not isinstance(self.node, atom.Atom):
+            raise TypeError(f"node must be an Atom, got {type(self.node)}")
+        
+        if not (0 <= self.id <= 0xFFFFFFFF):
+            raise ValueError(f"id must be 0-4294967295, got {self.id}")
+        
+        if not (0 <= self.serial <= 0xFFFFFFFF):
+            raise ValueError(f"serial must be 0-4294967295, got {self.serial}")
+        
+        if not (0 <= self.creation <= 0xFFFFFFFF):
+            raise ValueError(f"creation must be 0-4294967295, got {self.creation}")
+    
+    def __str__(self) -> str:
+        """Display format similar to Erlang's #Pid<...>"""
+        return f"#Pid<{self.node.name}.{self.id}.{self.serial}>"
+    
+    def __repr__(self) -> str:
+        """Detailed representation for debugging"""
+        return f"Pid({self.node.name!r}, {self.id}, {self.serial}, {self.creation})"
+    
+    def __hash__(self) -> int:
+        """Hash for use in sets and as dict keys"""
+        return hash((self.node, self.id, self.serial, self.creation))
+    
+    def is_local(self, local_node: atom.Atom) -> bool:
+        """Check if this PID is on the local node"""
+        return self.node == local_node
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization"""
+        return {
+            'node': self.node.name,
+            'id': self.id,
+            'serial': self.serial,
+            'creation': self.creation
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Pid':
+        """Create PID from dictionary"""
+        return cls(
+            node=atom.ensure(data['node']),
+            id=data['id'],
+            serial=data['serial'],
+            creation=data['creation']
+        )
+
+
+# ============================================================================
+# Process Protocol
+# ============================================================================
 
 @runtime_checkable
 class Process(Protocol):
     """Protocol for a runtime-managed process."""
     
     @property
-    def pid(self) -> str:
+    def pid(self) -> Pid:
         """Get the process identifier."""
         ...
     
@@ -39,6 +127,10 @@ class Process(Protocol):
         """Check if the process is alive."""
         ...
 
+
+# ============================================================================
+# Runtime Backend Protocol
+# ============================================================================
 
 @runtime_checkable
 class RuntimeBackend(Protocol):
@@ -62,7 +154,7 @@ class RuntimeBackend(Protocol):
         mailbox: bool = True,
         trap_exits: bool = False,
         characteristics: Optional[ProcessCharacteristics] = None
-    ) -> str:
+    ) -> Pid:
         """
         Spawn a new process.
         
@@ -88,7 +180,7 @@ class RuntimeBackend(Protocol):
         name: Optional[str] = None,
         mailbox: bool = True,
         characteristics: Optional[ProcessCharacteristics] = None
-    ) -> str:
+    ) -> Pid:
         """
         Spawn a process and link it to the current process.
         
@@ -104,7 +196,7 @@ class RuntimeBackend(Protocol):
         name: Optional[str] = None,
         mailbox: bool = True,
         characteristics: Optional[ProcessCharacteristics] = None
-    ) -> tuple[str, str]:
+    ) -> tuple[Pid, str]:
         """
         Spawn a process and monitor it from the current process.
         
@@ -116,18 +208,18 @@ class RuntimeBackend(Protocol):
     
     async def exit(
         self,
-        pid: str,
+        pid: Union[Pid, str],  # Accept both Pid and registered name
         reason: Any
     ) -> None:
         """
         Send an exit signal to a process.
         
-        :param pid: Process to send exit signal to
+        :param pid: Process (Pid) or registered name (str) to send exit signal to
         :param reason: Exit reason (atom or exception)
         """
         ...
     
-    def self(self) -> Optional[str]:
+    def self(self) -> Optional[Pid]:  # Changed from str to Pid
         """
         Get the PID of the current process.
         
@@ -139,31 +231,31 @@ class RuntimeBackend(Protocol):
     # Process Relationships
     # =========================================================================
     
-    async def link(self, pid: str) -> None:
+    async def link(self, pid: Union[Pid, str]) -> None:  # Accept both
         """
         Link the current process to another process.
         
         Creates bidirectional link - if either dies, the other is notified.
         
-        :param pid: Process to link to
+        :param pid: Process (Pid) or registered name (str) to link to
         """
         ...
     
-    async def unlink(self, pid: str) -> None:
+    async def unlink(self, pid: Union[Pid, str]) -> None:  # Accept both
         """
         Remove link between current process and another process.
         
-        :param pid: Process to unlink from
+        :param pid: Process (Pid) or registered name (str) to unlink from
         """
         ...
     
-    async def monitor(self, pid: str) -> str:
+    async def monitor(self, pid: Union[Pid, str]) -> str:  # Accept both
         """
         Monitor another process from the current process.
         
         When target dies, current process receives a DOWN message.
         
-        :param pid: Process to monitor
+        :param pid: Process (Pid) or registered name (str) to monitor
         :returns: Monitor reference
         """
         ...
@@ -187,13 +279,13 @@ class RuntimeBackend(Protocol):
     
     async def send(
         self,
-        pid: Union[str, Process],
+        target: Union[Pid, str, Process],  # Accept Pid, registered name, or Process
         message: Any
     ) -> None:
         """
         Send a message to a process.
         
-        :param pid: Process ID, registered name, or Process object
+        :param pid: Process ID (Pid), registered name (str), or Process object
         :param message: Message to send
         """
         ...
@@ -233,7 +325,7 @@ class RuntimeBackend(Protocol):
     async def send_after(
         self,
         delay: float,
-        target: str,
+        target: Union[Pid, str],  # Accept both
         message: Any
     ) -> str:
         """
@@ -277,7 +369,7 @@ class RuntimeBackend(Protocol):
     async def register(
         self,
         name: str,
-        pid: Optional[str] = None
+        pid: Optional[Pid] = None
     ) -> None:
         """
         Register a name for a process.
@@ -295,7 +387,7 @@ class RuntimeBackend(Protocol):
         """
         ...
     
-    def whereis(self, name: str) -> Optional[str]:
+    def whereis(self, name: str) -> Optional[Pid]:
         """
         Look up a PID by registered name.
         
@@ -304,7 +396,7 @@ class RuntimeBackend(Protocol):
         """
         ...
     
-    def whereis_name(self, pid: str) -> Optional[str]:
+    def whereis_name(self, pid: Pid) -> Optional[str]:
         """
         Look up a registered name by PID (reverse lookup).
     
@@ -325,18 +417,18 @@ class RuntimeBackend(Protocol):
     # Process Inspection
     # =========================================================================
     
-    def is_alive(self, pid: str) -> bool:
+    def is_alive(self, pid: Union[Pid, str]) -> bool:  # Accept both
         """
         Check if a process is alive.
         
-        :param pid: Process ID
+        :param pid: Process ID (Pid) or registered name (str)
         :returns: True if alive, False otherwise
         """
         ...
     
     def process_info(
         self,
-        pid: Optional[str] = None
+        pid: Optional[Pid] = None
     ) -> Optional[ProcessInfo]:
         """
         Get information about a process.
@@ -346,7 +438,7 @@ class RuntimeBackend(Protocol):
         """
         ...
     
-    def processes(self) -> List[str]:
+    def processes(self) -> List[Pid]:
         """
         Get all process IDs.
         
@@ -377,6 +469,10 @@ class RuntimeBackend(Protocol):
         """Get runtime statistics and metrics."""
         ...
 
+
+# ============================================================================
+# Exceptions
+# ============================================================================
 
 class RuntimeError(Exception):
     """Base exception for runtime errors."""

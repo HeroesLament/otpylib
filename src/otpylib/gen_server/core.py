@@ -278,7 +278,8 @@ async def reply(from_: tuple[str, str], response: Any) -> None:
 
 async def _call_from_process(target: str, payload: Any, timeout: Optional[float], call_id: str, caller_pid: str) -> Any:
     target_pid = process.whereis(target)
-    if not target_pid or target_pid == target:
+    target_name = process.whereis_name(target)
+    if not target_pid and not target_name:
         raise ValueError(f"GenServer '{target}' not found in registry")
 
     ref = await process.monitor(target_pid)

@@ -265,7 +265,7 @@ def whereis(name: str) -> Optional[str]:
     return runtime.whereis(name)
 
 
-def whereis_name(name: str) -> Optional[str]:
+def whereis_name(pid: str) -> Optional[str]:
     """
     Look up the registered name of a PID.
     
@@ -276,7 +276,7 @@ def whereis_name(name: str) -> Optional[str]:
     if not runtime:
         return None
     
-    return runtime.whereis_name(name)
+    return runtime.whereis_name(pid)
 
 
 def self() -> Optional[str]:

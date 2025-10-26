@@ -259,14 +259,11 @@ class OTPModule(type):
         # First, create the class using type's __new__
         cls = super().__new__(mcs, name, bases, namespace)
         
-        # Extract required metaclass arguments
+        # Extract metaclass arguments
         behavior = kwargs.get('behavior')
         version = kwargs.get('version')
         
-        # Validate required arguments
-        if behavior is None:
-            raise NoBehaviorSpecifiedError(name)
-        
+        # Validate version (required)
         if version is None:
             raise NoVersionSpecifiedError(name)
         
@@ -283,12 +280,13 @@ class OTPModule(type):
         # Collect all async callbacks
         callbacks = collect_callbacks(namespace)
         
-        # Validate behavior contract
-        try:
-            validate_behavior_contract(name, behavior, callbacks)
-        except BehaviorContractError:
-            # Re-raise contract errors as-is
-            raise
+        # Only validate if behavior is specified
+        if behavior is not None:
+            try:
+                validate_behavior_contract(name, behavior, callbacks)
+            except BehaviorContractError:
+                # Re-raise contract errors as-is
+                raise
         
         # Optional: Strict signature validation
         # Uncomment to enable strict arity checking
@@ -327,45 +325,71 @@ class OTPModule(type):
         # Mark as created and validated
         cls.__state__ = VALIDATED
         
-        # Add the universal start_link classmethod that routes to behavior implementation
-        async def _start_link(init_arg: Any = None, name: Optional[str] = None) -> str:
-            """
-            Start this OTPModule using its behavior's start_link.
-            
-            This method dynamically routes to the appropriate behavior module
-            based on the module's declared behavior (gen_server, supervisor, etc.)
-            
-            Args:
-                init_arg: Initialization argument passed to the module's init callback
-                name: Optional registered name for the process
+        # Only add start_link for behavioral modules (process-spawning)
+        if behavior is not None:
+            # Add the universal start_link classmethod that routes to behavior implementation
+            async def _start_link(init_arg: Any = None, name: Optional[str] = None) -> str:
+                """
+                Start this OTPModule using its behavior's start_link.
                 
-            Returns:
-                Process PID
-            """
-            behavior_name = cls.__behavior__.name
+                This method dynamically routes to the appropriate behavior module
+                based on the module's declared behavior (gen_server, supervisor, etc.)
+                
+                Args:
+                    init_arg: Initialization argument passed to the module's init callback
+                    name: Optional registered name for the process
+                    
+                Returns:
+                    Process PID
+                """
+                behavior_name = cls.__behavior__.name
+                
+                # Convention: behaviors live in otpylib.{behavior_name}
+                try:
+                    behavior_module = importlib.import_module(f"otpylib.{behavior_name}")
+                except ImportError as e:
+                    raise RuntimeError(
+                        f"Cannot import behavior module 'otpylib.{behavior_name}' for {cls.__name__}: {e}"
+                    )
+                
+                # Every behavior module must provide a start_link function
+                if not hasattr(behavior_module, 'start_link'):
+                    raise RuntimeError(
+                        f"Behavior module 'otpylib.{behavior_name}' does not provide start_link function"
+                    )
+                
+                # Call the behavior's start_link with this class
+                return await behavior_module.start_link(cls, init_arg=init_arg, name=name)
             
-            # Convention: behaviors live in otpylib.{behavior_name}
-            # e.g., gen_server -> otpylib.gen_server
-            #       supervisor -> otpylib.supervisor
-            #       dynamic_supervisor -> otpylib.dynamic_supervisor
-            try:
-                behavior_module = importlib.import_module(f"otpylib.{behavior_name}")
-            except ImportError as e:
-                raise RuntimeError(
-                    f"Cannot import behavior module 'otpylib.{behavior_name}' for {cls.__name__}: {e}"
-                )
+            # Attach as a classmethod so it can be called as: MyModule.start_link(...)
+            cls.start_link = classmethod(lambda cls, init_arg=None, name=None: _start_link(init_arg, name))
+
+        # For plain modules (no behavior), add instance tracking for future hot-reload support
+        if behavior is None:
+            from weakref import WeakSet
+            cls.__instances__ = WeakSet()
             
-            # Every behavior module must provide a start_link function
-            if not hasattr(behavior_module, 'start_link'):
-                raise RuntimeError(
-                    f"Behavior module 'otpylib.{behavior_name}' does not provide start_link function"
-                )
+            # Wrap __init__ to track instances
+            original_init = cls.__init__ if hasattr(cls, '__init__') else lambda self: None
             
-            # Call the behavior's start_link with this class
-            return await behavior_module.start_link(cls, init_arg=init_arg, name=name)
-        
-        # Attach as a classmethod so it can be called as: MyModule.start_link(...)
-        cls.start_link = classmethod(lambda cls, init_arg=None, name=None: _start_link(init_arg, name))
+            def tracked_init(self, *args, **kwargs):
+                cls.__instances__.add(self)
+                original_init(self, *args, **kwargs)
+            
+            cls.__init__ = tracked_init
+            
+            # TODO: Add __getattribute__ hook for hot-reload method indirection
+            # This will allow instances to automatically use reloaded code when
+            # code_server loads a new version. Implementation deferred until
+            # code_server is complete.
+            #
+            # Planned approach:
+            # def hot_reload_getattribute(self, name):
+            #     latest_cls = code_server.get_current(cls.__mod_id__)
+            #     if latest_cls is not cls and callable(getattr(latest_cls, name, None)):
+            #         return getattr(latest_cls, name).__get__(self, latest_cls)
+            #     return object.__getattribute__(self, name)
+            # cls.__getattribute__ = hot_reload_getattribute
         
         return cls
     
@@ -387,9 +411,10 @@ class OTPModule(type):
     
     def __repr__(cls):
         """String representation of the module class."""
+        behavior_str = cls.__behavior__.name if cls.__behavior__ is not None else 'plain'
         return (
             f"<OTPModule {cls.__mod_id__} "
-            f"behavior={cls.__behavior__.name} "
+            f"behavior={behavior_str} "
             f"callbacks={len(cls.__callbacks__)}>"
         )
 
@@ -416,7 +441,7 @@ def get_module_info(cls: type) -> Dict[str, Any]:
         'name': cls.__atoms__['modname'].name,
         'mod_id': cls.__mod_id__,
         'version': cls.__version__,
-        'behavior': cls.__behavior__.name,
+        'behavior': cls.__behavior__.name if cls.__behavior__ is not None else None,
         'callbacks': list(cls.__callbacks__.keys()),
         'registered_at': cls.__registered_at__,
         'dependencies': cls.__dependencies__,

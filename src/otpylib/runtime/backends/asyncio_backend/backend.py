@@ -774,38 +774,41 @@ class AsyncIOBackend(RuntimeBackend):
     # =========================================================================
 
     async def sleep(self, seconds: float) -> None:
-        """Suspend the current process for the specified duration."""
         event = asyncio.Event()
         ref = f"sleep_{id(event)}"
-        self.timing_wheel.schedule_callback(seconds, ref, event.set)
+        # Use insert() with callback
+        delay_ms = int(seconds * 1000)
+        self.timing_wheel.insert(ref, delay_ms, "", None, callback=event.set)
         await event.wait()
 
-    async def send_after(
-        self,
-        delay: float,
-        target: Union[Pid, str],
-        message: Any
-    ) -> str:
-        """Send a message after a delay."""
-        # Resolve name to PID
+    async def send_after(self, delay: float, target: Union[Pid, str], message: Any) -> str:
+        # Resolve target
         if isinstance(target, str):
             target_pid = self._name_registry.get(target)
             if not target_pid:
                 raise ProcessNotFoundError(f"Process {target} not found")
         else:
             target_pid = target
-        
-        ref = f"timer_{self.timing_wheel._schedule_counter}"
-        self.timing_wheel.schedule_message(delay, ref, target_pid, message)
+
+        # Use backend's own counter
+        self._ref_counter += 1
+        ref = f"timer_{self._ref_counter}"
+
+        # Use insert() with message (no callback)
+        delay_ms = int(delay * 1000)
+        self.timing_wheel.insert(ref, delay_ms, target_pid, message, callback=None)
         return ref
 
     async def cancel_timer(self, ref: str) -> bool:
         """Cancel a timer by reference."""
         return self.timing_wheel.cancel(ref)
-
+    
     async def read_timer(self, ref: str) -> Optional[float]:
         """Read remaining time on a timer in seconds."""
-        return self.timing_wheel.read(ref)
+        remaining_ms = self.timing_wheel.read_timer(ref)  # deleg to timingwheel
+        if remaining_ms is None:
+            return None
+        return remaining_ms / 1000.0  # Convert ms to seconds
 
     # =========================================================================
     # Process Registry
@@ -832,10 +835,32 @@ class AsyncIOBackend(RuntimeBackend):
 
     def whereis(self, name: Union[atom.Atom, str]) -> Optional[Pid]:
         """Look up a PID by registered name."""
-        return self._name_registry.get(name)
-
+        pid = self._name_registry.get(name)
+        if pid is None:
+            return None
+        
+        # Check if process is still alive
+        if not self.is_alive(pid):
+            # Clean up dead registration
+            self._name_registry.pop(name, None)
+            return None
+        
+        return pid
+    
     def whereis_name(self, pid: Pid) -> Optional[Union[atom.Atom, str]]:
         """Look up a registered name by PID (reverse lookup)."""
+        # If the PID is dead, it definitely shouldn't have a registration
+        if not self.is_alive(pid):
+            # Clean up any stale registration for this dead PID
+            name = None
+            for n, registered_pid in list(self._name_registry.items()):
+                if registered_pid == pid:
+                    name = n
+                    self._name_registry.pop(n, None)
+                    break
+            return None
+        
+        # PID is alive, do normal lookup
         for name, registered_pid in self._name_registry.items():
             if registered_pid == pid:
                 return name

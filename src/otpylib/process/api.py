@@ -7,7 +7,7 @@ Provides BEAM-like process operations without exposing runtime details.
 
 from typing import Any, Optional, List, Dict, Callable, Tuple
 from otpylib.runtime import get_runtime, set_runtime
-from otpylib.runtime.backends.base import NotInProcessError, ProcessNotFoundError
+from otpylib.runtime.backends.base import NotInProcessError, ProcessNotFoundError, Pid
 
 
 async def spawn(
@@ -279,7 +279,7 @@ def whereis_name(pid: str) -> Optional[str]:
     return runtime.whereis_name(pid)
 
 
-def self() -> Optional[str]:
+def self() -> Optional[Pid]:
     """
     Get the PID of the current process.
     

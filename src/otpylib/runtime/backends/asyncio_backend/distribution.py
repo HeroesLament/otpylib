@@ -6,8 +6,10 @@ Wires the AsyncIO-based Node transport to AsyncIOBackend's process scheduler.
 
 from typing import Any, Optional
 
+from otpylib.distribution.etf import encode
+
 from otpylib.runtime.backends.asyncio_backend.node import AsyncIONode
-from otpylib.distribution.etf import Pid
+from otpylib.runtime.backends.asyncio_backend.pid import Pid
 from otpylib.runtime.backends.asyncio_backend.backend import AsyncIOBackend
 
 
@@ -57,8 +59,11 @@ class AsyncIODistribution:
         except Exception:
             pass
         
+        # Inform the backend of the node_name and set it
+        backend.set_node_name(node_name, creation)
+        
         # Create the AsyncIO-specific node
-        self.node = AsyncIONode(node_name, cookie, creation=creation)
+        self.node = AsyncIONode(node_name, cookie, creation=creation, backend=backend)
         
         # Wire up message delivery to backend's process registry
         async def deliver_to_local(target_name: str, message: Any):
@@ -112,7 +117,17 @@ class AsyncIODistribution:
             message: Message to send
         """
         await self.node.send_to_pid(remote_node, pid, message)
-    
+
+
+    async def send_control_message(self, remote_node: str, control_msg):
+        if remote_node not in self.node.connections:
+            await self.connect(remote_node)
+        
+        conn = self.node.connections[remote_node]
+        control_bytes = encode(control_msg.to_tuple())
+        await conn.send_message(control_bytes, payload=b'')
+
+
     async def shutdown(self) -> None:
         """Stop distribution and close all connections."""
         self.node.close()

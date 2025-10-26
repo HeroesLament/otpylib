@@ -1,7 +1,8 @@
 # otpylib/distribution/etf.py
 """
 External Term Format (ETF) codec for Erlang interoperability.
-Integrates with otpylib.atom for native atom support.
+Integrates with otpylib.atom for native atom support and otpylib.runtime.base.Pid
+for native PID support.
 
 Spec: https://www.erlang.org/doc/apps/erts/erl_ext_dist.html
 """
@@ -11,6 +12,8 @@ from typing import Any, Tuple
 from dataclasses import dataclass
 
 from otpylib import atom
+from otpylib.runtime.backends.base import Pid
+from otpylib.distribution.reference import Reference
 
 # ETF Version
 VERSION = 131
@@ -42,38 +45,6 @@ NEW_PORT_EXT = 89        # New port format
 
 
 @dataclass
-class Pid:
-    """
-    Erlang process identifier.
-    Maps to OTPYLIB process ids, but maintains ETF format for wire protocol.
-    """
-    node: Any  # atom.Atom
-    id: int
-    serial: int
-    creation: int
-    
-    def __str__(self):
-        return f"<{self.id}.{self.serial}.{self.creation}@{self.node.name}>"
-    
-    def __repr__(self):
-        return f"Pid(node={self.node!r}, id={self.id}, serial={self.serial}, creation={self.creation})"
-
-
-@dataclass
-class Reference:
-    """Erlang reference"""
-    node: Any  # atom.Atom
-    creation: int
-    ids: Tuple[int, ...]
-    
-    def __str__(self):
-        return f"#Ref<{self.creation}.{'.'.join(map(str, self.ids))}>"
-    
-    def __repr__(self):
-        return f"Reference(node={self.node!r}, creation={self.creation}, ids={self.ids})"
-
-
-@dataclass
 class Port:
     """Erlang port identifier"""
     node: Any  # atom.Atom
@@ -85,7 +56,7 @@ class Port:
 
 
 class ETFDecoder:
-    """Decode ETF binary to Python objects with OTPYLIB atom integration"""
+    """Decode ETF binary to Python objects with OTPYLIB atom and Pid integration"""
     
     def __init__(self, data: bytes):
         self.data = data
@@ -244,7 +215,7 @@ class ETFDecoder:
 
 
 class ETFEncoder:
-    """Encode Python objects to ETF binary with OTPYLIB atom support"""
+    """Encode Python objects to ETF binary with OTPYLIB atom and Pid support"""
     
     def __init__(self):
         self.buffer = bytearray()
@@ -274,8 +245,17 @@ class ETFEncoder:
         self.buffer.extend(struct.pack('>i', value))
     
     def encode_term(self, term: Any):
-        # Check for OTPYLIB atom first!
-        if (hasattr(term, '__class__') and 
+        # Check for OTPYLIB Pid first!
+        if isinstance(term, Pid):
+            # Encode real OTPYLIB Pid!
+            self.write_byte(NEW_PID_EXT)
+            self.encode_term(term.node)
+            self.write_u32(term.id)
+            self.write_u32(term.serial)
+            self.write_u32(term.creation)
+        
+        # Check for OTPYLIB atom
+        elif (hasattr(term, '__class__') and 
             term.__class__.__name__ == 'Atom' and
             hasattr(term, 'name')):
             # This is an otpylib.atom.Atom
@@ -357,13 +337,6 @@ class ETFEncoder:
                 self.encode_term(key)
                 self.encode_term(value)
         
-        elif isinstance(term, Pid):
-            self.write_byte(NEW_PID_EXT)
-            self.encode_term(term.node)
-            self.write_u32(term.id)
-            self.write_u32(term.serial)
-            self.write_u32(term.creation)
-        
         elif isinstance(term, Reference):
             self.write_byte(NEWER_REFERENCE_EXT)
             self.write_u16(len(term.ids))
@@ -393,33 +366,32 @@ def decode(data: bytes) -> Any:
     return ETFDecoder(data).decode()
 
 
-# Helper for converting OTPYLIB pids to ETF Pids
-def otpylib_pid_to_etf(pid_str: str, node_name: str = "otpylib@nohost") -> Pid:
-    """
-    Convert OTPYLIB pid string (e.g., "pid_abc123") to ETF Pid.
-    
-    Args:
-        pid_str: OTPYLIB process id string
-        node_name: Node name for this OTPYLIB instance
-    
-    Returns:
-        ETF Pid suitable for wire protocol
-    """
-    # Extract numeric portion from pid string
-    # "pid_abc123" -> hash to id/serial
-    pid_hash = hash(pid_str)
-    id_part = abs(pid_hash) & 0x7FFFFFFF  # 31 bits
-    serial_part = (abs(pid_hash) >> 31) & 0x1FFF  # 13 bits
-    
-    node_atom = atom.ensure(node_name)
-    return Pid(node_atom, id_part, serial_part, creation=1)
+# Helper functions for atom encoding (used by distribution layer)
+def encode_atom(atom_obj: atom.Atom) -> bytes:
+    """Encode just an atom (without ETF version byte)"""
+    name_bytes = atom_obj.name.encode('utf-8')
+    if len(name_bytes) < 256:
+        return bytes([SMALL_ATOM_UTF8_EXT, len(name_bytes)]) + name_bytes
+    else:
+        return bytes([ATOM_UTF8_EXT]) + struct.pack('>H', len(name_bytes)) + name_bytes
 
 
-def etf_pid_to_otpylib(etf_pid: Pid) -> str:
-    """
-    Convert ETF Pid back to OTPYLIB pid string.
-    This is lossy - we create a synthetic pid string.
+def decode_atom(data: bytes, pos: int) -> tuple[atom.Atom, int]:
+    """Decode an atom from data (used by distribution layer)"""
+    tag = data[pos]
+    pos += 1
     
-    For true bidirectional mapping, maintain a pid translation table.
-    """
-    return f"pid_{etf_pid.node.name}_{etf_pid.id}_{etf_pid.serial}"
+    if tag in (ATOM_EXT, ATOM_UTF8_EXT):
+        length = struct.unpack('>H', data[pos:pos+2])[0]
+        pos += 2
+        name = data[pos:pos+length].decode('utf-8' if tag == ATOM_UTF8_EXT else 'latin-1')
+        pos += length
+    elif tag == SMALL_ATOM_UTF8_EXT:
+        length = data[pos]
+        pos += 1
+        name = data[pos:pos+length].decode('utf-8')
+        pos += length
+    else:
+        raise ValueError(f"Invalid atom tag: {tag}")
+    
+    return atom.ensure(name), pos

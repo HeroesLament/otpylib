@@ -1,6 +1,6 @@
 [project]
 name = "otpylib"
-version = "0.5.8"
+version = "0.5.13"
 description = "The OTP framework for Python."
 
 authors = [

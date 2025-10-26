@@ -30,6 +30,8 @@ Usage pattern:
 
 from typing import Any, Optional
 
+from otpylib.runtime.backends.base import Pid
+
 from otpylib.distribution.protocol import (
     EPMDProtocol,
     NodeProtocol,
@@ -39,7 +41,8 @@ from otpylib.distribution.protocol import (
 from otpylib.distribution.node import Node
 from otpylib.distribution.connection import Connection
 from otpylib.distribution.epmd import EPMD, NodeInfo
-from otpylib.distribution.etf import Pid, Reference, Port, encode, decode
+from otpylib.distribution.etf import Port, encode, decode
+from otpylib.distribution.reference import Reference
 
 # Control message constants
 from otpylib.distribution.constants import (

@@ -11,12 +11,13 @@ import random
 from typing import Optional, Callable, Awaitable, Any
 
 from otpylib import atom
-from otpylib.distribution.etf import encode, decode, Pid, ETFDecoder
+from otpylib.distribution.etf import encode, decode, ETFDecoder
 from otpylib.distribution.constants import (
     DEFAULT_FLAGS,
     CTRL_REG_SEND,
     CTRL_SEND,
 )
+from otpylib.runtime.backends.asyncio_backend.pid import Pid
 
 
 class AsyncIOConnection:
@@ -290,7 +291,37 @@ class AsyncIOConnection:
             
             self.writer.write(header + packet)
             await self.writer.drain()
-    
+
+
+    async def send_message(self, control_bytes: bytes, payload: bytes = b''):
+        """
+        Send a raw control message (for LINK, MONITOR, EXIT, etc.)
+        
+        Args:
+            control_bytes: ETF-encoded control tuple (without version byte)
+            payload: Optional ETF-encoded payload (without version byte)
+        """
+        if not self.connected:
+            raise ConnectionError("Not connected")
+        
+        async with self._send_lock:
+            # Strip version bytes if present
+            if control_bytes and control_bytes[0] == 131:
+                control_bytes = control_bytes[1:]
+            if payload and payload[0] == 131:
+                payload = payload[1:]
+            
+            # Distribution header (no atom cache)
+            dist_header = bytes([131, 68, 0])
+            
+            # Combine: dist_header + control + payload
+            packet = dist_header + control_bytes + payload
+            header = struct.pack('>I', len(packet))
+            
+            self.writer.write(header + packet)
+            await self.writer.drain()
+
+
     async def receive(self) -> Optional[Any]:
         """Receive next message from the connection."""
         async with self._recv_lock:

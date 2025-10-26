@@ -7,10 +7,46 @@ Manages connections to remote Erlang/OTP nodes and message routing.
 import asyncio
 from typing import Optional, Dict, Any, Callable, Awaitable
 
+from otpylib.distribution.etf import decode
+from otpylib.distribution.constants import (
+    CTRL_LINK,
+    CTRL_SEND,
+    CTRL_EXIT,
+    CTRL_UNLINK,
+    CTRL_REG_SEND,
+    CTRL_EXIT2,
+    CTRL_MONITOR_P,
+    CTRL_DEMONITOR_P,
+    CTRL_MONITOR_P_EXIT,
+)
+from otpylib.runtime.backends.asyncio_backend.control_messages import (
+    ControlMessage,
+    LinkMessage,
+    UnlinkMessage,
+    ExitMessage,
+    MonitorMessage,
+    DemonitorMessage,
+    MonitorExitMessage,
+    SendMessage,
+    RegSendMessage
+)
 from otpylib.runtime.backends.asyncio_backend.connection import AsyncIOConnection
 from otpylib.runtime.backends.asyncio_backend.epmd import AsyncIOEPMD
 from otpylib.distribution.etf import Pid
 
+
+
+HANDLED_CONTROL_TYPES = frozenset({
+    CTRL_LINK,
+    CTRL_SEND,
+    CTRL_EXIT,
+    CTRL_UNLINK,
+    CTRL_REG_SEND,
+    CTRL_EXIT2,
+    CTRL_MONITOR_P,
+    CTRL_DEMONITOR_P,
+    CTRL_MONITOR_P_EXIT,
+})
 
 class AsyncIONode:
     """
@@ -25,7 +61,7 @@ class AsyncIONode:
         await node.send("other@localhost", "registered_name", message)
     """
     
-    def __init__(self, name: str, cookie: str, creation: int = 1):
+    def __init__(self, name: str, cookie: str, creation: int = 1, backend = None):
         self.name = name
         self.short_name = name.split('@')[0]
         self.host = name.split('@')[1] if '@' in name else 'localhost'
@@ -36,6 +72,7 @@ class AsyncIONode:
         self.port: Optional[int] = None
         self._local_delivery: Optional[Callable[[str, Any], Awaitable[None]]] = None
         self._epmd_connection: Optional[tuple] = None  # Store (reader, writer) for EPMD
+        self.backend = backend
     
     def set_local_delivery(self, handler: Callable[[str, Any], Awaitable[None]]):
         """
@@ -88,26 +125,17 @@ class AsyncIONode:
                 """Handle incoming distributed messages."""
                 if self._local_delivery:
                     try:
-                        # Messages are tuples: (control_msg, actual_msg)
-                        # For REG_SEND: control is (6, from_pid, unused, to_name)
+                        # Messages are tuples: (control_tuple, payload_bytes)
                         if isinstance(message, tuple) and len(message) >= 2:
                             control, payload = message[0], message[1]
-                            
-                            if isinstance(control, tuple) and len(control) >= 4:
+
+                            if isinstance(control, tuple) and len(control) >= 1:
                                 msg_type = control[0]
-                                if msg_type == 6:  # REG_SEND
-                                    to_name_atom = control[3]
-                                    # Extract string from Atom
-                                    to_name = str(to_name_atom) if hasattr(to_name_atom, 'value') else str(to_name_atom)
-                                    await self._local_delivery(to_name, payload)
-                                elif msg_type == 2:  # SEND (to PID)
-                                    to_pid = control[2]
-                                else:
-                                    pass
-                            else:
-                                pass
-                        else:
-                            pass
+
+                                # Route to control handler if it's a control message we handle
+                                if msg_type in HANDLED_CONTROL_TYPES:
+                                    await self._handle_control(control, payload)
+
                     except Exception as e:
                         import traceback
                         traceback.print_exc()
@@ -122,7 +150,30 @@ class AsyncIONode:
             traceback.print_exc()
             writer.close()
             await writer.wait_closed()
-    
+
+
+    async def _handle_control(self, control_tuple: tuple, payload: Optional[bytes]):
+        msg = ControlMessage.parse(control_tuple)
+
+        # Route to backend
+        if isinstance(msg, LinkMessage):
+            await self.backend.link_remote_incoming(msg.from_pid, msg.to_pid)
+        elif isinstance(msg, UnlinkMessage):
+            await self.backend.unlink_remote_incoming(msg.from_pid, msg.to_pid)
+        elif isinstance(msg, ExitMessage):
+            await self.backend.exit_remote_incoming(msg.from_pid, msg.to_pid, msg.reason)
+        elif isinstance(msg, MonitorMessage):
+            await self.backend.monitor_remote_incoming(msg.from_pid, msg.to_pid, msg.ref)
+        elif isinstance(msg, DemonitorMessage):
+            await self.backend.demonitor_remote_incoming(msg.from_pid, msg.to_pid, msg.ref)
+        elif isinstance(msg, MonitorExitMessage):
+            await self.backend.monitor_exit_remote_incoming(msg.from_pid, msg.to_pid, msg.ref, msg.reason)
+        elif isinstance(msg, SendMessage):
+            await msg.handle(self.backend, payload)
+        elif isinstance(msg, RegSendMessage):
+            await msg.handle(self.backend, payload)
+
+
     async def _receive_loop(self, conn: AsyncIOConnection, remote_node: str):
         """
         Continuously receive messages from a connection.
@@ -138,6 +189,8 @@ class AsyncIONode:
                 if message is None:
                     # Connection closed
                     break
+                
+                print(f"[_receive_loop] Received from {remote_node}: {message}")
                 
                 if conn.message_handler:
                     await conn.message_handler(message)
@@ -175,25 +228,27 @@ class AsyncIONode:
         # Set up message handler for incoming messages on this connection
         async def message_handler(message: Any):
             """Handle incoming distributed messages."""
+            print(f"[node_b message_handler] Received message: {message}")  # ADD THIS
+
             if self._local_delivery:
                 try:
-                    # Messages are tuples: (control_msg, actual_msg)
+                    # Messages are tuples: (control_tuple, payload_bytes)
                     if isinstance(message, tuple) and len(message) >= 2:
                         control, payload = message[0], message[1]
-                        if isinstance(control, tuple) and len(control) >= 4:
+
+                        print(f"[node_b message_handler] Control: {control}")  # ADD THIS
+                        print(f"[node_b message_handler] Payload: {payload}")  # ADD THIS
+
+                        if isinstance(control, tuple) and len(control) >= 1:
                             msg_type = control[0]
-                            if msg_type == 6:  # REG_SEND
-                                to_name_atom = control[3]
-                                to_name = str(to_name_atom) if hasattr(to_name_atom, 'value') else str(to_name_atom)
-                                await self._local_delivery(to_name, payload)
-                            elif msg_type == 2:  # SEND (to PID)
-                                to_pid = control[2]
+                            print(f"[node_b message_handler] Message type: {msg_type}")  # ADD THIS
+
+                            # Route to control handler if it's a control message we handle
+                            if msg_type in HANDLED_CONTROL_TYPES:
+                                print(f"[node_b message_handler] Routing to _handle_control")  # ADD THIS
+                                await self._handle_control(control, payload)
                             else:
-                                pass
-                        else:
-                            pass
-                    else:
-                        pass
+                                print(f"[node_b message_handler] Message type {msg_type} not in HANDLED_CONTROL_TYPES")  # ADD THIS
                 except Exception as e:
                     import traceback
                     traceback.print_exc()

@@ -891,9 +891,21 @@ class AsyncIOBackend(RuntimeBackend):
         target_pid = pid if pid is not None else self.self()
         if not target_pid:
             return None
-
+    
         process = self._processes.get(target_pid)
-        return process.info if process else None
+        if not process:
+            return None
+        
+        info = process.info
+        
+        # Populate from Process state
+        info.monitors = set(process.monitors.keys())           # Set of refs
+        info.monitored_by = set(process.monitored_by.keys())   # Set of refs
+        info.links = set(str(p) for p in process.links)        # Set of PIDs
+        info.trap_exits = process.trap_exits
+        info.message_queue_length = process.mailbox.queue.qsize() if process.mailbox else 0
+        
+        return info
 
     def processes(self) -> List[Pid]:
         """Get all process IDs."""
